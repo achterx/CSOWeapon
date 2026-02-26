@@ -1,7 +1,7 @@
-// dllmain.cpp  v8
-// Wait for mp.dll AND for gpGlobals to be non-null before patching.
-// gpGlobals is set when the server calls GiveFnptrsToDll — if we patch
-// before that, all time-based logic sees t=0 forever.
+// dllmain.cpp  v9
+// Wait until mp.dll is loaded AND gpGlobals->time > 0 (server is running).
+// The time float lives at *(float*)(*(uintptr_t*)(mp+0x1E51BCC)).
+// We poll it until it's > 0.1 before calling FrostbiteFix_Init.
 
 #include <windows.h>
 #include <cstdint>
@@ -10,9 +10,22 @@
 
 bool FrostbiteFix_Init(HMODULE hMp);
 
-// RVA of the gpGlobals pointer in mp.dll (immediately after engfuncs block)
-// engfuncs RVA 0x1E51878 + 218*4 = 0x1E51BE0
-static const uintptr_t kRVA_ppGlobals = 0x1E51BE0;
+// dword_11E51BCC RVA — holds gpGlobals pointer (or is itself the time ptr)
+static const uintptr_t kRVA_pGlobals = 0x1E51BCC;
+
+static float ReadTime(HMODULE hMp)
+{
+    uintptr_t mpBase = reinterpret_cast<uintptr_t>(hMp);
+    // dword_11E51BCC is a pointer: *(float*)(*(uint32_t*)(mp + RVA)) = time
+    uint32_t inner = 0;
+    __try { inner = *reinterpret_cast<uint32_t*>(mpBase + kRVA_pGlobals); }
+    __except(EXCEPTION_EXECUTE_HANDLER) { return -1.0f; }
+    if (!inner) return 0.0f;
+    float t = 0.0f;
+    __try { t = *reinterpret_cast<float*>((uintptr_t)inner); }
+    __except(EXCEPTION_EXECUTE_HANDLER) { return -2.0f; }
+    return t;
+}
 
 static DWORD WINAPI RetryThread(LPVOID)
 {
@@ -22,48 +35,42 @@ static DWORD WINAPI RetryThread(LPVOID)
 
         HMODULE hMp = GetModuleHandleA("mp.dll");
         if (!hMp) {
-            Log("[frostbite_fix] TryInit: mp.dll not loaded yet\n");
+            if (i % 4 == 0) Log("[frostbite_fix] waiting for mp.dll...\n");
             continue;
         }
 
-        // Check if gpGlobals has been set yet (i.e. GiveFnptrsToDll was called)
-        uintptr_t mpBase = reinterpret_cast<uintptr_t>(hMp);
-        uint32_t* ppGlobals = reinterpret_cast<uint32_t*>(mpBase + kRVA_ppGlobals);
-        uint32_t globalsVal = 0;
-        __try { globalsVal = *ppGlobals; } __except(EXCEPTION_EXECUTE_HANDLER) {}
-
-        if (!globalsVal) {
-            Log("[frostbite_fix] TryInit: mp.dll loaded but gpGlobals=0, waiting...\n");
+        float t = ReadTime(hMp);
+        if (t < 0.1f) {
+            if (i % 4 == 0)
+                Log("[frostbite_fix] mp.dll loaded, waiting for server start (t=%.3f)...\n", t);
             continue;
         }
 
         HMODULE hHw = GetModuleHandleA("hw.dll");
-        Log("[frostbite_fix] TryInit: mp.dll=0x%08zX hw.dll=0x%08zX gpGlobals=0x%08X — init\n",
-            mpBase, (uintptr_t)hHw, globalsVal);
+        Log("[frostbite_fix] mp.dll=0x%08zX hw.dll=0x%08zX t=%.3f — INIT\n",
+            (uintptr_t)hMp, (uintptr_t)hHw, t);
 
         __try {
-            bool ok = FrostbiteFix_Init(hMp);
-            if (ok) {
-                Log("[frostbite_fix] RetryThread: init succeeded\n");
+            if (FrostbiteFix_Init(hMp)) {
+                Log("[frostbite_fix] init OK\n");
                 return 0;
             }
-            Log("[frostbite_fix] RetryThread: init returned false, retrying...\n");
+            Log("[frostbite_fix] init failed, retrying...\n");
         } __except(EXCEPTION_EXECUTE_HANDLER) {
-            Log("[frostbite_fix] RetryThread: EXCEPTION, retrying...\n");
+            Log("[frostbite_fix] EXCEPTION during init, retrying...\n");
         }
     }
-    Log("[frostbite_fix] RetryThread: gave up after 120s\n");
+    Log("[frostbite_fix] gave up after 120s\n");
     return 0;
 }
 
 BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH) {
-        Log("[frostbite_fix] *** DLL_PROCESS_ATTACH ***\n");
+        Log("[frostbite_fix] DLL_PROCESS_ATTACH\n");
         DisableThreadLibraryCalls(hInst);
-        Log("[frostbite_fix] Spawning retry thread\n");
-        HANDLE hThread = CreateThread(nullptr, 0, RetryThread, nullptr, 0, nullptr);
-        if (hThread) CloseHandle(hThread);
+        HANDLE h = CreateThread(nullptr, 0, RetryThread, nullptr, 0, nullptr);
+        if (h) CloseHandle(h);
     }
     return TRUE;
 }
