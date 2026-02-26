@@ -1,64 +1,45 @@
-// frostbite_fix.cpp  v13
+// frostbite_fix.cpp  v14
 //
-// DIAGNOSTIC + CALL-THROUGH hooks.
-//
-// The server already has all 8 CFrostbite functions (confirmed: v12 patched
-// slots with the same values they already had). So the code exists but
-// something is silently failing.
-//
-// v13 strategy:
-//   1. Hook each slot with a CALL-THROUGH wrapper that logs inputs/state
-//   2. NEVER reimplement logic — just call the original and log around it
-//   3. This tells us WHICH function is failing and WHY
+// DIAGNOSTIC: patch BOTH vtables and log which one fires.
 //
 // From IDA (client mp.dll, imagebase 0x10000000):
-//   WeaponIdle      RVA 0xB30C80   slot 165
-//   Think           RVA 0xB31100   slot 166
-//   PrimaryAttack   RVA 0xB30E90   slot 167
-//   SecondaryAttack RVA 0xB30F60   slot 168
-//   AddToPlayer     RVA 0xB30FE0   slot 175
-//   Holster         RVA 0xB31040   slot 191
-//   TakeDamage      RVA 0xB31060   slot 193
-//   PropThink       RVA 0xB312C0   slot 194
+//   const CFrostbite::vftable           @ 0x115D4C80  RVA 0x015D4C80
+//   const CSimpleWpn<CFrostbite>::vftable @ 0x115D48CC  RVA 0x015D48CC
 //
-// Key offsets (byte-based, confirmed from decompilation):
-//   this+0x13C = m_flNextPrimaryAttack
-//   this+0x154 = ammo
-//   this+0x15C = m_iClip
-//   this+0x18C = m_flTimeWeaponIdle
-//   this+0x194 = shot counter
-//   this+0x1D8 = config ID
-//   this+0x1EC = m_iDefaultAmmo
-//   this+0x1E8 = event handle (uint16)
-//   this+0x1FC = charge state float
-//   this+0x204 = secondary state
-//   this+0x0D0 = m_pPlayer
+// v13 proved hooks installed in CFrostbite vtable never fired.
+// Hypothesis: weapon is instantiated as CSimpleWpn<CFrostbite> not CFrostbite,
+// so the game routes through the CSimpleWpn vtable instead.
+//
+// v14: patch slots 165-194 in BOTH vtables with call-throughs,
+// log which vtable fires first.
+//
+// Slot map from IDA dump (client, CFrostbite vtable):
+//   165 WeaponIdle, 166 Think, 167 PrimaryAttack, 168 SecondaryAttack
+//   175 AddToPlayer, 191 Holster, 193 TakeDamage, 194 PropThink
 
 #include <windows.h>
 #include <cstdint>
-#include <cstring>
 #include "givefnptrs.h"
 #include "logger.h"
 
-// ---------------------------------------------------------------------------
-// Field accessor
-// ---------------------------------------------------------------------------
 template<typename T>
-static inline T& Field(void* base, int byteOff)
+static inline T& Field(void* base, int off)
 {
-    return *reinterpret_cast<T*>(reinterpret_cast<uint8_t*>(base) + byteOff);
+    return *reinterpret_cast<T*>(reinterpret_cast<uint8_t*>(base) + off);
 }
 
-// ---------------------------------------------------------------------------
-// Vtable helpers
-// ---------------------------------------------------------------------------
-static inline void** GetVtable(void* obj)
-{
-    return *reinterpret_cast<void***>(obj);
-}
+static float NOW() { return g_pGlobals ? g_pGlobals->time : 0.0f; }
 
-// Save/restore original function pointers
-struct OrigFns {
+// Vtable RVAs (client imagebase 0x10000000)
+static const uintptr_t kRVA_FB_Vtable     = 0x015D4C80;  // CFrostbite
+static const uintptr_t kRVA_Simple_Vtable = 0x015D48CC;  // CSimpleWpn<CFrostbite>
+
+static uintptr_t g_mpBase  = 0;
+static bool      g_patched = false;
+
+// Original function storage — indexed [0]=FB vtable, [1]=Simple vtable
+#define NVTBLS 2
+static struct OrigSet {
     uintptr_t WeaponIdle;
     uintptr_t Think;
     uintptr_t PrimaryAttack;
@@ -67,10 +48,8 @@ struct OrigFns {
     uintptr_t Holster;
     uintptr_t TakeDamage;
     uintptr_t PropThink;
-};
-static OrigFns g_orig = {};
+} g_orig[NVTBLS];
 
-// Vtable slot numbers (client IDA confirmed)
 #define SLOT_WEAPONIDLE       165
 #define SLOT_THINK            166
 #define SLOT_PRIMARYATTACK    167
@@ -80,152 +59,139 @@ static OrigFns g_orig = {};
 #define SLOT_TAKEDAMAGE       193
 #define SLOT_PROP_THINK       194
 
-// CFrostbite vtable RVA
-static const uintptr_t kRVA_Vtable = 0x15D4C80;
+// ---------------------------------------------------------------------------
+// Hook factories — FB=0, Simple=1
+// Each hook logs its vtable source tag, then calls original
+// ---------------------------------------------------------------------------
 
-static uintptr_t g_mpBase  = 0;
-static bool      g_patched = false;
-
-// gpGlobals->time shorthand
-static float NOW()
+// WeaponIdle
+static void __fastcall Hook_WeaponIdle_FB(void* w, void*)
 {
-    return g_pGlobals ? g_pGlobals->time : 0.0f;
+    Log("[FB-vtbl0] WeaponIdle w=%p t=%.2f\n", w, NOW());
+    typedef void(__thiscall* F)(void*);
+    if (g_orig[0].WeaponIdle) reinterpret_cast<F>(g_orig[0].WeaponIdle)(w);
+}
+static void __fastcall Hook_WeaponIdle_SW(void* w, void*)
+{
+    Log("[FB-vtbl1] WeaponIdle w=%p t=%.2f\n", w, NOW());
+    typedef void(__thiscall* F)(void*);
+    if (g_orig[1].WeaponIdle) reinterpret_cast<F>(g_orig[1].WeaponIdle)(w);
 }
 
-// ---------------------------------------------------------------------------
-// HOOK: WeaponIdle (slot 165)
-// Log state, then call original
-// ---------------------------------------------------------------------------
-static void __fastcall Hook_WeaponIdle(void* wpn, void* edx)
+// Think
+static void __fastcall Hook_Think_FB(void* w, void*)
 {
-    float idleTime = Field<float>(wpn, 0x18C);
-    float t        = NOW();
-    void* pPlayer  = Field<void*>(wpn, 0x0D0);
-
-    Log("[FB] WeaponIdle wpn=%p player=%p idleTime=%.2f now=%.2f\n",
-        wpn, pPlayer, idleTime, t);
-
-    typedef void(__thiscall* Fn)(void*);
-    reinterpret_cast<Fn>(g_orig.WeaponIdle)(wpn);
+    Log("[FB-vtbl0] Think w=%p t=%.2f\n", w, NOW());
+    typedef void(__thiscall* F)(void*);
+    if (g_orig[0].Think) reinterpret_cast<F>(g_orig[0].Think)(w);
+}
+static void __fastcall Hook_Think_SW(void* w, void*)
+{
+    Log("[FB-vtbl1] Think w=%p t=%.2f\n", w, NOW());
+    typedef void(__thiscall* F)(void*);
+    if (g_orig[1].Think) reinterpret_cast<F>(g_orig[1].Think)(w);
 }
 
-// ---------------------------------------------------------------------------
-// HOOK: Think (slot 166)
-// ---------------------------------------------------------------------------
-static void __fastcall Hook_Think(void* wpn, void* edx)
+// PrimaryAttack
+static void __fastcall Hook_PrimaryAttack_FB(void* w, void*)
 {
-    float t       = NOW();
-    int   freeze  = Field<int>  (wpn, 348);
-    float active  = Field<float>(wpn, 508);
-
-    Log("[FB] Think wpn=%p t=%.2f freeze=%d active=%.2f\n",
-        wpn, t, freeze, active);
-
-    typedef void(__thiscall* Fn)(void*);
-    reinterpret_cast<Fn>(g_orig.Think)(wpn);
+    int ammo = Field<int>(w, 0x154);
+    Log("[FB-vtbl0] PrimaryAttack w=%p ammo=%d t=%.2f\n", w, ammo, NOW());
+    typedef void(__thiscall* F)(void*);
+    if (g_orig[0].PrimaryAttack) reinterpret_cast<F>(g_orig[0].PrimaryAttack)(w);
+    Log("[FB-vtbl0] PrimaryAttack DONE ammo=%d\n", Field<int>(w, 0x154));
+}
+static void __fastcall Hook_PrimaryAttack_SW(void* w, void*)
+{
+    int ammo = Field<int>(w, 0x154);
+    Log("[FB-vtbl1] PrimaryAttack w=%p ammo=%d t=%.2f\n", w, ammo, NOW());
+    typedef void(__thiscall* F)(void*);
+    if (g_orig[1].PrimaryAttack) reinterpret_cast<F>(g_orig[1].PrimaryAttack)(w);
+    Log("[FB-vtbl1] PrimaryAttack DONE ammo=%d\n", Field<int>(w, 0x154));
 }
 
-// ---------------------------------------------------------------------------
-// HOOK: PrimaryAttack (slot 167)
-// ---------------------------------------------------------------------------
-static void __fastcall Hook_PrimaryAttack(void* wpn, void* edx)
+// SecondaryAttack
+static void __fastcall Hook_SecondaryAttack_FB(void* w, void*)
 {
-    int   ammo      = Field<int>  (wpn, 0x154);
-    float nextAtk   = Field<float>(wpn, 0x13C);
-    float charge    = Field<float>(wpn, 0x1FC);
-    uint16_t evHdl  = Field<uint16_t>(wpn, 0x1E8);
-    void* pPlayer   = Field<void*>(wpn, 0x0D0);
-    float t         = NOW();
-
-    Log("[FB] PrimaryAttack wpn=%p player=%p ammo=%d nextAtk=%.2f charge=%.2f evHdl=%d t=%.2f\n",
-        wpn, pPlayer, ammo, nextAtk, charge, (int)evHdl, t);
-
-    typedef void(__thiscall* Fn)(void*);
-    reinterpret_cast<Fn>(g_orig.PrimaryAttack)(wpn);
-
-    // Log state after
-    Log("[FB] PrimaryAttack DONE ammo=%d nextAtk=%.2f\n",
-        Field<int>(wpn, 0x154), Field<float>(wpn, 0x13C));
+    Log("[FB-vtbl0] SecondaryAttack w=%p nextAtk=%.2f charge=%.2f t=%.2f\n",
+        w, Field<float>(w,0x13C), Field<float>(w,0x1FC), NOW());
+    typedef void(__thiscall* F)(void*);
+    if (g_orig[0].SecondaryAttack) reinterpret_cast<F>(g_orig[0].SecondaryAttack)(w);
+    Log("[FB-vtbl0] SecondaryAttack DONE nextAtk=%.2f charge=%.2f\n",
+        Field<float>(w,0x13C), Field<float>(w,0x1FC));
+}
+static void __fastcall Hook_SecondaryAttack_SW(void* w, void*)
+{
+    Log("[FB-vtbl1] SecondaryAttack w=%p nextAtk=%.2f charge=%.2f t=%.2f\n",
+        w, Field<float>(w,0x13C), Field<float>(w,0x1FC), NOW());
+    typedef void(__thiscall* F)(void*);
+    if (g_orig[1].SecondaryAttack) reinterpret_cast<F>(g_orig[1].SecondaryAttack)(w);
+    Log("[FB-vtbl1] SecondaryAttack DONE nextAtk=%.2f charge=%.2f\n",
+        Field<float>(w,0x13C), Field<float>(w,0x1FC));
 }
 
-// ---------------------------------------------------------------------------
-// HOOK: SecondaryAttack (slot 168)
-// ---------------------------------------------------------------------------
-static void __fastcall Hook_SecondaryAttack(void* wpn, void* edx)
+// AddToPlayer
+static int __fastcall Hook_AddToPlayer_FB(void* w, void*, void* p)
 {
-    float nextAtk = Field<float>(wpn, 0x13C);
-    float charge  = Field<float>(wpn, 0x1FC);
-    float secSt   = Field<float>(wpn, 0x204);
-    int   cfgId   = Field<int>  (wpn, 0x1D8);
-    void* pPlayer = Field<void*>(wpn, 0x0D0);
-    float t       = NOW();
-
-    Log("[FB] SecondaryAttack wpn=%p player=%p nextAtk=%.2f charge=%.2f sec=%.2f cfg=%d t=%.2f\n",
-        wpn, pPlayer, nextAtk, charge, secSt, cfgId, t);
-
-    typedef void(__thiscall* Fn)(void*);
-    reinterpret_cast<Fn>(g_orig.SecondaryAttack)(wpn);
-
-    Log("[FB] SecondaryAttack DONE nextAtk=%.2f charge=%.2f\n",
-        Field<float>(wpn, 0x13C), Field<float>(wpn, 0x1FC));
+    Log("[FB-vtbl0] AddToPlayer w=%p player=%p cfgId=%d\n",
+        w, p, Field<int>(w,0x1D8));
+    typedef int(__thiscall* F)(void*,void*);
+    int r = g_orig[0].AddToPlayer ? reinterpret_cast<F>(g_orig[0].AddToPlayer)(w,p) : 1;
+    Log("[FB-vtbl0] AddToPlayer DONE ret=%d cfgId=%d evHdl=%d\n",
+        r, Field<int>(w,0x1D8), (int)Field<uint16_t>(w,0x1E8));
+    return r;
+}
+static int __fastcall Hook_AddToPlayer_SW(void* w, void*, void* p)
+{
+    Log("[FB-vtbl1] AddToPlayer w=%p player=%p cfgId=%d\n",
+        w, p, Field<int>(w,0x1D8));
+    typedef int(__thiscall* F)(void*,void*);
+    int r = g_orig[1].AddToPlayer ? reinterpret_cast<F>(g_orig[1].AddToPlayer)(w,p) : 1;
+    Log("[FB-vtbl1] AddToPlayer DONE ret=%d cfgId=%d evHdl=%d\n",
+        r, Field<int>(w,0x1D8), (int)Field<uint16_t>(w,0x1E8));
+    return r;
 }
 
-// ---------------------------------------------------------------------------
-// HOOK: AddToPlayer (slot 175)
-// ---------------------------------------------------------------------------
-static int __fastcall Hook_AddToPlayer(void* wpn, void* edx, void* pPlayer)
+// Holster
+static void __fastcall Hook_Holster_FB(void* w, void*, int sk)
 {
-    int cfgId = Field<int>(wpn, 0x1D8);
-    Log("[FB] AddToPlayer wpn=%p player=%p cfgId=%d\n", wpn, pPlayer, cfgId);
-
-    typedef int(__thiscall* Fn)(void*, void*);
-    int ret = reinterpret_cast<Fn>(g_orig.AddToPlayer)(wpn, pPlayer);
-
-    Log("[FB] AddToPlayer DONE ret=%d cfgId=%d evHdl=%d\n",
-        ret, Field<int>(wpn, 0x1D8), (int)Field<uint16_t>(wpn, 0x1E8));
-    return ret;
+    Log("[FB-vtbl0] Holster w=%p skip=%d\n", w, sk);
+    typedef void(__thiscall* F)(void*,int);
+    if (g_orig[0].Holster) reinterpret_cast<F>(g_orig[0].Holster)(w,sk);
+}
+static void __fastcall Hook_Holster_SW(void* w, void*, int sk)
+{
+    Log("[FB-vtbl1] Holster w=%p skip=%d\n", w, sk);
+    typedef void(__thiscall* F)(void*,int);
+    if (g_orig[1].Holster) reinterpret_cast<F>(g_orig[1].Holster)(w,sk);
 }
 
-// ---------------------------------------------------------------------------
-// HOOK: Holster (slot 191)
-// ---------------------------------------------------------------------------
-static void __fastcall Hook_Holster(void* wpn, void* edx, int skipLocal)
+// TakeDamage
+static int __fastcall Hook_TakeDamage_FB(void* w, void*, void* info, float dmg)
 {
-    Log("[FB] Holster wpn=%p skip=%d clip=%d ammo=%d\n",
-        wpn, skipLocal, Field<int>(wpn, 0x15C), Field<int>(wpn, 0x154));
-
-    typedef void(__thiscall* Fn)(void*, int);
-    reinterpret_cast<Fn>(g_orig.Holster)(wpn, skipLocal);
+    Log("[FB-vtbl0] TakeDamage w=%p dmg=%.1f\n", w, dmg);
+    typedef int(__thiscall* F)(void*,void*,float);
+    return g_orig[0].TakeDamage ? reinterpret_cast<F>(g_orig[0].TakeDamage)(w,info,dmg) : 1;
+}
+static int __fastcall Hook_TakeDamage_SW(void* w, void*, void* info, float dmg)
+{
+    Log("[FB-vtbl1] TakeDamage w=%p dmg=%.1f\n", w, dmg);
+    typedef int(__thiscall* F)(void*,void*,float);
+    return g_orig[1].TakeDamage ? reinterpret_cast<F>(g_orig[1].TakeDamage)(w,info,dmg) : 1;
 }
 
-// ---------------------------------------------------------------------------
-// HOOK: TakeDamage (slot 193)
-// ---------------------------------------------------------------------------
-static int __fastcall Hook_TakeDamage(void* wpn, void* edx, void* info, float dmg)
+// PropThink
+static void __fastcall Hook_PropThink_FB(void* p, void*)
 {
-    Log("[FB] TakeDamage wpn=%p info=%p dmg=%.1f\n", wpn, info, dmg);
-
-    typedef int(__thiscall* Fn)(void*, void*, float);
-    int ret = reinterpret_cast<Fn>(g_orig.TakeDamage)(wpn, info, dmg);
-
-    Log("[FB] TakeDamage DONE ret=%d\n", ret);
-    return ret;
+    Log("[FB-vtbl0] PropThink p=%p t=%.2f\n", p, NOW());
+    typedef void(__thiscall* F)(void*);
+    if (g_orig[0].PropThink) reinterpret_cast<F>(g_orig[0].PropThink)(p);
 }
-
-// ---------------------------------------------------------------------------
-// HOOK: PropThink (slot 194)
-// ---------------------------------------------------------------------------
-static void __fastcall Hook_PropThink(void* prop, void* edx)
+static void __fastcall Hook_PropThink_SW(void* p, void*)
 {
-    float t      = NOW();
-    float active = Field<float>(prop, 508);
-    int   freeze = Field<int>  (prop, 348);
-
-    Log("[FB] PropThink prop=%p t=%.2f active=%.2f freeze=%d\n",
-        prop, t, active, freeze);
-
-    typedef void(__thiscall* Fn)(void*);
-    reinterpret_cast<Fn>(g_orig.PropThink)(prop);
+    Log("[FB-vtbl1] PropThink p=%p t=%.2f\n", p, NOW());
+    typedef void(__thiscall* F)(void*);
+    if (g_orig[1].PropThink) reinterpret_cast<F>(g_orig[1].PropThink)(p);
 }
 
 // ---------------------------------------------------------------------------
@@ -243,7 +209,6 @@ static bool SafeWrite(uintptr_t addr, uintptr_t val)
     VirtualProtect((void*)addr, 4, old, &old);
     return true;
 }
-
 static bool SafeRead(uintptr_t addr, uintptr_t& out)
 {
     __try { out = *(uintptr_t*)addr; return true; }
@@ -251,13 +216,50 @@ static bool SafeRead(uintptr_t addr, uintptr_t& out)
 }
 
 // ---------------------------------------------------------------------------
+// Patch one vtable
+// ---------------------------------------------------------------------------
+struct SlotDef {
+    int         idx;
+    const char* name;
+    uintptr_t*  orig;
+    void*       hook;
+};
+
+static int PatchVtable(uintptr_t vtbl, SlotDef* slots, int n, const char* tag)
+{
+    uintptr_t s0 = 0;
+    if (!SafeRead(vtbl, s0)) {
+        Log("[FB] %s FATAL: unreadable @ 0x%08zX\n", tag, vtbl);
+        return 0;
+    }
+    Log("[FB] %s vtable @ 0x%08zX slot[0]=0x%08zX\n", tag, vtbl, s0);
+
+    int ok = 0;
+    for (int i = 0; i < n; i++)
+    {
+        uintptr_t slotAddr = vtbl + slots[i].idx * 4;
+        uintptr_t cur = 0;
+        if (!SafeRead(slotAddr, cur)) {
+            Log("[FB] %s slot %d unreadable\n", tag, slots[i].idx);
+            continue;
+        }
+        *slots[i].orig = cur;
+        Log("[FB] %s slot %3d %-16s orig=0x%08zX\n", tag, slots[i].idx, slots[i].name, cur);
+        if (SafeWrite(slotAddr, (uintptr_t)slots[i].hook))
+            ok++;
+        else
+            Log("[FB] %s slot %d write FAILED\n", tag, slots[i].idx);
+    }
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
 // FrostbiteFix_Init
 // ---------------------------------------------------------------------------
 bool FrostbiteFix_Init(HMODULE hMp)
 {
-    Log("\n=== FrostbiteFix_Init v13 === mp.dll=0x%08X\n", (uintptr_t)hMp);
-
-    if (g_patched) { Log("[FB] already patched\n"); return true; }
+    Log("\n=== FrostbiteFix_Init v14 === mp.dll=0x%08X\n", (uintptr_t)hMp);
+    if (g_patched) { Log("[FB] already done\n"); return true; }
 
     if (!GiveFnptrs_Init(hMp)) {
         Log("[FB] FATAL: GiveFnptrs_Init failed\n");
@@ -266,57 +268,35 @@ bool FrostbiteFix_Init(HMODULE hMp)
 
     g_mpBase = (uintptr_t)hMp;
 
-    uintptr_t vtbl = g_mpBase + kRVA_Vtable;
-    uintptr_t s0   = 0;
-    if (!SafeRead(vtbl, s0)) {
-        Log("[FB] FATAL: cannot read vtable @ 0x%08zX\n", vtbl);
-        return false;
-    }
-    Log("[FB] vtable @ 0x%08zX slot[0]=0x%08zX\n", vtbl, s0);
-
-    struct Slot {
-        int         idx;
-        const char* name;
-        uintptr_t*  orig;
-        void*       hook;
-    } slots[] = {
-        { SLOT_WEAPONIDLE,      "WeaponIdle",      &g_orig.WeaponIdle,      (void*)Hook_WeaponIdle      },
-        { SLOT_THINK,           "Think",           &g_orig.Think,           (void*)Hook_Think           },
-        { SLOT_PRIMARYATTACK,   "PrimaryAttack",   &g_orig.PrimaryAttack,   (void*)Hook_PrimaryAttack   },
-        { SLOT_SECONDARYATTACK, "SecondaryAttack", &g_orig.SecondaryAttack, (void*)Hook_SecondaryAttack },
-        { SLOT_ADDTOPLAYER,     "AddToPlayer",     &g_orig.AddToPlayer,     (void*)Hook_AddToPlayer     },
-        { SLOT_HOLSTER,         "Holster",         &g_orig.Holster,         (void*)Hook_Holster         },
-        { SLOT_TAKEDAMAGE,      "TakeDamage",      &g_orig.TakeDamage,      (void*)Hook_TakeDamage      },
-        { SLOT_PROP_THINK,      "PropThink",       &g_orig.PropThink,       (void*)Hook_PropThink       },
+    // --- Patch CFrostbite vtable (vtbl index 0) ---
+    SlotDef fbSlots[] = {
+        { SLOT_WEAPONIDLE,      "WeaponIdle",      &g_orig[0].WeaponIdle,      (void*)Hook_WeaponIdle_FB      },
+        { SLOT_THINK,           "Think",           &g_orig[0].Think,           (void*)Hook_Think_FB           },
+        { SLOT_PRIMARYATTACK,   "PrimaryAttack",   &g_orig[0].PrimaryAttack,   (void*)Hook_PrimaryAttack_FB   },
+        { SLOT_SECONDARYATTACK, "SecondaryAttack", &g_orig[0].SecondaryAttack, (void*)Hook_SecondaryAttack_FB },
+        { SLOT_ADDTOPLAYER,     "AddToPlayer",     &g_orig[0].AddToPlayer,     (void*)Hook_AddToPlayer_FB     },
+        { SLOT_HOLSTER,         "Holster",         &g_orig[0].Holster,         (void*)Hook_Holster_FB         },
+        { SLOT_TAKEDAMAGE,      "TakeDamage",      &g_orig[0].TakeDamage,      (void*)Hook_TakeDamage_FB      },
+        { SLOT_PROP_THINK,      "PropThink",       &g_orig[0].PropThink,       (void*)Hook_PropThink_FB       },
     };
+    PatchVtable(g_mpBase + kRVA_FB_Vtable, fbSlots, 8, "CFrostbite");
 
-    int ok = 0, fail = 0;
-    for (auto& s : slots)
-    {
-        uintptr_t slotAddr = vtbl + s.idx * 4;
-        uintptr_t current  = 0;
-        if (!SafeRead(slotAddr, current)) {
-            Log("[FB]   Slot %3d %-16s: UNREADABLE\n", s.idx, s.name);
-            fail++; continue;
-        }
+    // --- Patch CSimpleWpn<CFrostbite> vtable (vtbl index 1) ---
+    // Slot numbers may differ — patch same indices first as a probe,
+    // then we'll see which tag fires in the log
+    SlotDef swSlots[] = {
+        { SLOT_WEAPONIDLE,      "WeaponIdle",      &g_orig[1].WeaponIdle,      (void*)Hook_WeaponIdle_SW      },
+        { SLOT_THINK,           "Think",           &g_orig[1].Think,           (void*)Hook_Think_SW           },
+        { SLOT_PRIMARYATTACK,   "PrimaryAttack",   &g_orig[1].PrimaryAttack,   (void*)Hook_PrimaryAttack_SW   },
+        { SLOT_SECONDARYATTACK, "SecondaryAttack", &g_orig[1].SecondaryAttack, (void*)Hook_SecondaryAttack_SW },
+        { SLOT_ADDTOPLAYER,     "AddToPlayer",     &g_orig[1].AddToPlayer,     (void*)Hook_AddToPlayer_SW     },
+        { SLOT_HOLSTER,         "Holster",         &g_orig[1].Holster,         (void*)Hook_Holster_SW         },
+        { SLOT_TAKEDAMAGE,      "TakeDamage",      &g_orig[1].TakeDamage,      (void*)Hook_TakeDamage_SW      },
+        { SLOT_PROP_THINK,      "PropThink",       &g_orig[1].PropThink,       (void*)Hook_PropThink_SW       },
+    };
+    PatchVtable(g_mpBase + kRVA_Simple_Vtable, swSlots, 8, "CSimpleWpn<FB>");
 
-        *s.orig = current;  // save original
-
-        Log("[FB]   Slot %3d %-16s: orig=0x%08zX hook=0x%08zX\n",
-            s.idx, s.name, current, (uintptr_t)s.hook);
-
-        if (SafeWrite(slotAddr, (uintptr_t)s.hook)) {
-            Log("[FB]     -> patched OK\n");
-            ok++;
-        } else {
-            Log("[FB]     -> FAILED\n");
-            *s.orig = 0;
-            fail++;
-        }
-    }
-
-    Log("[FB] %d OK, %d failed\n", ok, fail);
     g_patched = true;
     Log("=== FrostbiteFix_Init COMPLETE ===\n");
-    return fail == 0;
+    return true;
 }
