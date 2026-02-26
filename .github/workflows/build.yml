@@ -1,0 +1,90 @@
+name: Build frostbite_fix.dll
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-windows-x86:
+    name: Windows x86 (Release)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up MSVC (x86)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86   # CRITICAL — hlds.exe and mp.dll are 32-bit
+
+      - name: Configure CMake (x86 Release)
+        run: |
+          cmake -B build -A Win32 -DCMAKE_BUILD_TYPE=Release
+        # -A Win32 forces 32-bit even on 64-bit runner
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Verify output is 32-bit
+        shell: pwsh
+        run: |
+          $dll = "build\Release\frostbite_fix.dll"
+          if (!(Test-Path $dll)) { $dll = "build\frostbite_fix.dll" }
+          if (!(Test-Path $dll)) { Write-Error "DLL not found!"; exit 1 }
+
+          $bytes = [System.IO.File]::ReadAllBytes($dll)
+          # PE header offset at 0x3C
+          $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
+          # Machine type at PE+4
+          $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+          Write-Host "Machine type: 0x$($machine.ToString('X4'))"
+          if ($machine -ne 0x014C) {
+            Write-Error "ERROR: DLL is NOT x86 (0x014C)! Got 0x$($machine.ToString('X4'))"
+            exit 1
+          }
+          Write-Host "OK: DLL is x86 (32-bit) as required for hlds.exe"
+          $size = (Get-Item $dll).Length
+          Write-Host "DLL size: $size bytes"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frostbite_fix-win32-release
+          path: |
+            build/Release/frostbite_fix.dll
+            build/frostbite_fix.dll
+          if-no-files-found: error
+          retention-days: 30
+
+  build-windows-x86-debug:
+    name: Windows x86 (Debug)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up MSVC (x86)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Configure CMake (x86 Debug)
+        run: cmake -B build_debug -A Win32 -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build
+        run: cmake --build build_debug --config Debug --parallel
+
+      - name: Upload debug artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frostbite_fix-win32-debug
+          path: |
+            build_debug/Debug/frostbite_fix.dll
+            build_debug/frostbite_fix.dll
+          if-no-files-found: error
+          retention-days: 14
