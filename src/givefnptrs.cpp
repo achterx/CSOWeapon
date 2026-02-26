@@ -1,337 +1,361 @@
-#include "givefnptrs.h"
+// givefnptrs.cpp — CSNZ frostbite fix, v7
+// Fixes:
+//  1. Correct vtable detection (was finding entity-registry struct, not vtable)
+//  2. Log all engfuncs candidates with their index contents for manual validation
+//  3. Robust fallback: try all candidate engfuncs tables until SetOrigin looks valid
+
+#include <windows.h>
 #include <cstdint>
 #include <cstdio>
-#include <cstring>
-#include <TlHelp32.h>
+#include <vector>
+#include <algorithm>
+#include "givefnptrs.h"
+#include "logger.h"
 
-enginefuncs_t* g_engfuncs = nullptr;
-globalvars_t*  g_globals  = nullptr;
+enginefuncs_t g_engfuncs = {};
+globalvars_t* g_pGlobals = nullptr;
 
-static enginefuncs_t s_engfuncs{};
-static globalvars_t* s_globals_ptr = nullptr;
+// ─── PE helpers ─────────────────────────────────────────────────────────────
 
-// ---------------------------------------------------------------------------
-// Log helper
-// ---------------------------------------------------------------------------
-static void GLog(const char* fmt, ...)
-{
-    char buf[512];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    OutputDebugStringA(buf);
-    const char* paths[] = { "frostbite_fix.log", "C:\\frostbite_fix.log",
-                             "C:\\Temp\\frostbite_fix.log", nullptr };
-    for (int i = 0; paths[i]; ++i) {
-        FILE* f = fopen(paths[i], "a");
-        if (f) { fputs(buf, f); fflush(f); fclose(f); break; }
-    }
+static bool SafeRead32(const void* addr, uint32_t& out) {
+    __try {
+        out = *reinterpret_cast<const uint32_t*>(addr);
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
-// ---------------------------------------------------------------------------
-// Safe PE export lookup (SEH-protected)
-// ---------------------------------------------------------------------------
-static FARPROC SafeGetExport(HMODULE hMod, const char* exportName)
-{
-    if (!hMod) return nullptr;
+static IMAGE_NT_HEADERS* GetNtHeaders(HMODULE hMod) {
     __try {
-        auto* base = reinterpret_cast<uint8_t*>(hMod);
-        auto* dos  = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(hMod);
         if (dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
-        auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
-        if (nt->Signature != IMAGE_NT_SIGNATURE)  return nullptr;
-        auto& ed = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
-        if (!ed.VirtualAddress) return nullptr;
-        auto* exp  = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(base + ed.VirtualAddress);
-        auto* nams = reinterpret_cast<DWORD*>(base + exp->AddressOfNames);
-        auto* ords = reinterpret_cast<WORD* >(base + exp->AddressOfNameOrdinals);
-        auto* fns  = reinterpret_cast<DWORD*>(base + exp->AddressOfFunctions);
-        for (DWORD i = 0; i < exp->NumberOfNames; ++i) {
-            if (strcmp(reinterpret_cast<const char*>(base + nams[i]), exportName) == 0)
-                return reinterpret_cast<FARPROC>(base + fns[ords[i]]);
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        GLog("[GiveFnptrs] SafeGetExport SEH on %p for '%s'\n", hMod, exportName);
-    }
-    return nullptr;
+        auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(
+            reinterpret_cast<uint8_t*>(hMod) + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
+        return nt;
+    } __except(EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
 }
 
-// ---------------------------------------------------------------------------
-// Dump raw bytes of a function (first N bytes) for diagnosis
-// ---------------------------------------------------------------------------
-static void DumpFuncBytes(void* fn, const char* name, int count = 32)
-{
-    if (!fn) return;
-    __try {
-        auto* p = reinterpret_cast<uint8_t*>(fn);
-        char line[256]; int pos = 0;
-        pos += snprintf(line, sizeof(line), "[GiveFnptrs] %s @ %p bytes: ", name, fn);
-        for (int i = 0; i < count; ++i)
-            pos += snprintf(line + pos, sizeof(line) - pos, "%02X ", p[i]);
-        line[pos] = '\n'; line[pos+1] = 0;
-        GLog("%s", line);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        GLog("[GiveFnptrs] DumpFuncBytes SEH on %p\n", fn);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// CSNZ ARCHITECTURE (confirmed from log):
+// ─── Find a vtable for CWeaponFrostbite using two strategies ────────────────
 //
-//   GiveFnptrsToDll lives in mp.dll at 0x242D70F0.
-//   In standard GoldSrc: engine calls mp.dll's GiveFnptrsToDll(engfuncs, globals)
-//   so mp.dll can receive engine function pointers.
+// Strategy A: RTTI scan
+//   MSVC embeds ".?AVCWeaponFrostbite@@" (or similar) as a TypeDescriptor name.
+//   The Complete Object Locator that references it points to the vftable.
 //
-//   CSNZ appears to work the same way — but the struct passed in is a CSNZ
-//   custom enginefuncs that is MUCH LARGER than our stub enginefuncs_t.
-//   When the engine calls GiveFnptrsToDll normally, it fills the struct.
-//   But WE are calling it with no arguments yet — we need the engine to
-//   call it, or we need to find the already-filled global pointer.
+// Strategy B: Dense pointer block scan
+//   The vtable is a contiguous array of 50+ pointers, all within mp.dll .text,
+//   residing in mp.dll .rdata or .data.  We pick the LONGEST run that also has
+//   slot[0] == slot[1] (MSVC dtor pair) or slot[0] close to slot[1].
 //
-//   THE REAL SOLUTION:
-//   mp.dll has already been called by the CSNZ engine before we get here.
-//   The engine funcs are stored in a GLOBAL VARIABLE inside mp.dll.
-//   We scan mp.dll's .data/.rdata section for a pointer that looks like
-//   a valid enginefuncs_t (first entry = pfnPrecacheModel, which must point
-//   into the engine DLL's code section — hw.dll @ 02B50000, size 69906432).
-//
-//   hw.dll range: 0x02B50000 .. 0x02B50000 + 69906432 = ~0x06AF4000
-//   Any pointer in that range is almost certainly an engine function pointer.
-// ---------------------------------------------------------------------------
+// Strategy C (was v6, now rejected):
+//   Reading a ptr before a PUSH of the "frostbite" string → gives entity-registry
+//   struct, not the vtable.  We no longer use this.
 
-// Check if 'ptr' looks like it points into the engine (hw.dll)
-static bool IsEnginePtr(uint32_t ptr, uint32_t engBase, uint32_t engSize)
-{
-    return ptr >= engBase && ptr < engBase + engSize;
-}
+struct VtableCandidate {
+    uintptr_t addr;
+    int        run;      // number of consecutive mp.dll .text ptrs
+    bool       hasDtorPair; // slot[0]==slot[1]
+};
 
-// ---------------------------------------------------------------------------
-// Find the already-populated enginefuncs_t inside mp.dll's global data.
-// Strategy: scan mp.dll .data section for a run of N consecutive pointers
-// that all point into hw.dll. That's the engfuncs table.
-// ---------------------------------------------------------------------------
-static enginefuncs_t* FindEngfuncsInMpDll(HMODULE hMp, HMODULE hEngine)
-{
-    auto* mpBase   = reinterpret_cast<uint8_t*>(hMp);
-    auto* mpDos    = reinterpret_cast<IMAGE_DOS_HEADER*>(mpBase);
-    auto* mpNt     = reinterpret_cast<IMAGE_NT_HEADERS*>(mpBase + mpDos->e_lfanew);
+static uintptr_t FindFrostbiteVtable(HMODULE hMp) {
+    auto* nt = GetNtHeaders(hMp);
+    if (!nt) { Log("[FB] GetNtHeaders failed for mp.dll\n"); return 0; }
 
-    uint32_t engBase = (uint32_t)(uintptr_t)hEngine;
-    uint32_t engSize = 0;
-    __try {
-        auto* engDos = reinterpret_cast<IMAGE_DOS_HEADER*>(hEngine);
-        auto* engNt  = reinterpret_cast<IMAGE_NT_HEADERS*>(
-                           reinterpret_cast<uint8_t*>(hEngine) + engDos->e_lfanew);
-        engSize = engNt->OptionalHeader.SizeOfImage;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        GLog("[GiveFnptrs] FindEngfuncs: SEH reading engine headers\n");
-        return nullptr;
-    }
+    auto base   = reinterpret_cast<uintptr_t>(hMp);
+    auto mpSize = nt->OptionalHeader.SizeOfImage;
+    auto mpEnd  = base + mpSize;
 
-    GLog("[GiveFnptrs] Engine range: %08X .. %08X\n", engBase, engBase + engSize);
+    // mp.dll .text range heuristic: first ~70% of image is code
+    uintptr_t textLo = base + 0x1000;
+    uintptr_t textHi = base + (mpSize * 7 / 10);
 
-    // Also include mp.dll range — some engfuncs may be forwarded/thunked inside mp
-    uint32_t mpBase32  = (uint32_t)(uintptr_t)mpBase;
-    uint32_t mpSize    = mpNt->OptionalHeader.SizeOfImage;
+    // ── Strategy A: RTTI TypeDescriptor scan ─────────────────────────────
+    // Search for type-name substrings that MSVC embeds for CWeaponFrostbite
+    // MSVC mangled: ".?AVCWeaponFrostbite@@"  or  ".?AVCCSWeaponFrostBite@@" etc.
+    const char* rttiNames[] = {
+        "?AVCWeaponFrostbite",
+        "?AVCWeaponFrostBite",
+        "?AVCCSWeaponFrostbite",
+        "?AVCCSWeaponFrostBite",
+        "?AVWeaponFrostbite",
+        nullptr
+    };
 
-    // We need at least 8 consecutive engine pointers to be confident
-    // (pfnPrecacheModel, pfnPrecacheSound, pfnSetModel, pfnModelIndex... all engine)
-    constexpr int MIN_CONSECUTIVE = 8;
+    auto* data = reinterpret_cast<uint8_t*>(base);
 
-    auto* sec = IMAGE_FIRST_SECTION(mpNt);
-    for (WORD si = 0; si < mpNt->FileHeader.NumberOfSections; ++si, ++sec) {
-        // Only scan writable data sections (.data, .bss) — not .text or .rdata
-        bool isData = (sec->Characteristics & IMAGE_SCN_MEM_WRITE) != 0;
-        bool isExec = (sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
-        if (!isData || isExec) continue;
-
-        uint8_t* sb   = mpBase + sec->VirtualAddress;
-        size_t   ss   = sec->Misc.VirtualSize;
-        char secName[9] = {};
-        memcpy(secName, sec->Name, 8);
-        GLog("[GiveFnptrs] Scanning mp.dll section %s (RW, %zu bytes) @ %p\n",
-             secName, ss, sb);
-
-        // Walk 4-byte aligned
-        for (size_t off = 0; off + (MIN_CONSECUTIVE * 4) <= ss; off += 4) {
-            int consecutive = 0;
-            __try {
-                for (int k = 0; k < 24; ++k) {  // check up to 24 slots
-                    uint32_t v = *reinterpret_cast<uint32_t*>(sb + off + k * 4);
-                    bool inEng = IsEnginePtr(v, engBase, engSize);
-                    bool inMp  = (v >= mpBase32 && v < mpBase32 + mpSize);
-                    if (inEng || inMp) {
-                        consecutive++;
-                    } else {
-                        break;
+    for (int ni = 0; rttiNames[ni]; ni++) {
+        const char* needle = rttiNames[ni];
+        size_t nlen = strlen(needle);
+        Log("[FB-RTTI] Searching for RTTI name '%s'...\n", needle);
+        for (size_t off = 0; off + nlen + 4 < mpSize; off++) {
+            if (memcmp(data + off, needle, nlen) == 0) {
+                uintptr_t typeDescName = base + off;
+                // TypeDescriptor is at typeDescName - 8 (pVFTable ptr + spare)
+                // Actually the TypeDescriptor starts 8 bytes before the name string
+                uintptr_t typeDesc = typeDescName - 8;
+                Log("[FB-RTTI] TypeDescriptor candidate @ mp.dll+0x%zX  (name='%s')\n",
+                    off - 8, needle);
+                // Now search .rdata/.data for a CompleteObjectLocator that refs typeDesc
+                // COL layout: sig(4) offset(4) cdOffset(4) pTypeDesc(4) pClassDesc(4)
+                // We scan for any DWORD == typeDesc
+                for (size_t off2 = 0; off2 + 20 < mpSize; off2 += 4) {
+                    uint32_t v = 0;
+                    if (!SafeRead32(data + off2, v)) continue;
+                    if (v == (uint32_t)typeDesc) {
+                        // possible COL + 0xC
+                        uintptr_t colAddr = base + off2 - 12;
+                        uint32_t sig = 0, colOff = 0;
+                        SafeRead32((void*)colAddr, sig);
+                        SafeRead32((void*)(colAddr + 4), colOff);
+                        if (sig != 0) continue; // COL.signature must be 0 for 32-bit
+                        // vftable is at colAddr + 4 (ptr to COL sits 4 bytes before vftable[0])
+                        uintptr_t vtableAddr = colAddr + 4 + 4; // skip back-ptr then start
+                        // Actually: the ptr-to-COL sits immediately before vftable[0]
+                        // So if colAddr is the COL, search for a ptr TO colAddr in .rdata
+                        for (size_t off3 = 0; off3 + 4 < mpSize; off3 += 4) {
+                            uint32_t pCol = 0;
+                            if (!SafeRead32(data + off3, pCol)) continue;
+                            if (pCol == (uint32_t)colAddr) {
+                                uintptr_t vt = base + off3 + 4; // vftable[0] is right after ptr-to-COL
+                                // Validate: first slot should point into mp.dll .text
+                                uint32_t slot0 = 0;
+                                SafeRead32((void*)vt, slot0);
+                                if (slot0 >= textLo && slot0 < textHi) {
+                                    Log("[FB-RTTI] FOUND vtable via RTTI @ 0x%08zX  (mp.dll+0x%zX)  slot[0]=0x%08X\n",
+                                        vt, vt - base, slot0);
+                                    return vt;
+                                }
+                            }
+                        }
                     }
-                }
-            } __except (EXCEPTION_EXECUTE_HANDLER) { break; }
-
-            if (consecutive >= MIN_CONSECUTIVE) {
-                void** table = reinterpret_cast<void**>(sb + off);
-                GLog("[GiveFnptrs] Candidate engfuncs table @ mp.dll+0x%X  (%d consecutive engine ptrs)\n",
-                     (unsigned)(sb + off - mpBase), consecutive);
-                // Log first 12 entries
-                for (int k = 0; k < 12 && k < consecutive; ++k)
-                    GLog("[GiveFnptrs]   [%2d] %p\n", k, table[k]);
-
-                // Sanity: slot 0 (pfnPrecacheModel) and slot 1 (pfnPrecacheSound)
-                // must be non-null engine ptrs
-                if (IsEnginePtr((uint32_t)(uintptr_t)table[0], engBase, engSize) &&
-                    IsEnginePtr((uint32_t)(uintptr_t)table[1], engBase, engSize)) {
-                    GLog("[GiveFnptrs] CONFIRMED: this looks like enginefuncs_t!\n");
-                    return reinterpret_cast<enginefuncs_t*>(table);
                 }
             }
         }
     }
 
-    GLog("[GiveFnptrs] FindEngfuncsInMpDll: not found\n");
-    return nullptr;
-}
+    Log("[FB-RTTI] RTTI scan did not find vtable, falling back to dense-pointer scan\n");
 
-// ---------------------------------------------------------------------------
-// Also find g_globals (globalvars_t*) — it's a float* with time near 0..10000
-// stored right after or near the engfuncs ptr in mp.dll globals
-// ---------------------------------------------------------------------------
-static globalvars_t* FindGlobalsInMpDll(HMODULE hMp, enginefuncs_t* engfuncs)
-{
-    // globalvars_t** is typically stored right after the enginefuncs_t* global,
-    // or it's a global ptr in mp.dll's .data that points to a float (time value 0..86400)
-    // We'll scan for a pointer whose target[0] (time) is 0 <= x <= 86400 and
-    // target[1] (frametime) is 0 <= x <= 1.0
+    // ── Strategy B: Dense pointer block scan ─────────────────────────────
+    // We scan ALL of mp.dll (treating everything as potential ptr arrays).
+    // For each 4-byte aligned address, count how many consecutive DWORDs point
+    // into [textLo, textHi).  Track the best runs (≥50 ptrs).
+    // Among those, prefer runs where slot[0]==slot[1] (MSVC dtor pair).
 
-    auto* mpBase = reinterpret_cast<uint8_t*>(hMp);
-    auto* dos    = reinterpret_cast<IMAGE_DOS_HEADER*>(mpBase);
-    auto* nt     = reinterpret_cast<IMAGE_NT_HEADERS*>(mpBase + dos->e_lfanew);
-    uint32_t mpBase32 = (uint32_t)(uintptr_t)mpBase;
-    uint32_t mpSize   = nt->OptionalHeader.SizeOfImage;
+    std::vector<VtableCandidate> candidates;
+    int    curRun  = 0;
+    size_t runStart = 0;
 
-    auto* sec = IMAGE_FIRST_SECTION(nt);
-    for (WORD si = 0; si < nt->FileHeader.NumberOfSections; ++si, ++sec) {
-        bool isData = (sec->Characteristics & IMAGE_SCN_MEM_WRITE) != 0;
-        bool isExec = (sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
-        if (!isData || isExec) continue;
-
-        uint8_t* sb = mpBase + sec->VirtualAddress;
-        size_t   ss = sec->Misc.VirtualSize;
-
-        for (size_t off = 0; off + 4 <= ss; off += 4) {
-            __try {
-                uint32_t ptr = *reinterpret_cast<uint32_t*>(sb + off);
-                // Must point somewhere valid (not null, not obviously wrong)
-                if (ptr < 0x00010000 || ptr > 0x7FFFFFFF) continue;
-                // The pointed-to memory should be readable
-                float time      = *reinterpret_cast<float*>(ptr + 0);
-                float frametime = *reinterpret_cast<float*>(ptr + 4);
-                // time in [0, 86400], frametime in [0, 0.2]
-                if (time >= 0.f && time <= 86400.f &&
-                    frametime >= 0.f && frametime <= 0.2f) {
-                    GLog("[GiveFnptrs] Candidate g_globals @ mp.dll+0x%X  ptr=%p  time=%.3f  frametime=%.6f\n",
-                         (unsigned)(sb + off - mpBase), (void*)(uintptr_t)ptr, time, frametime);
-                    return reinterpret_cast<globalvars_t*>((void*)(uintptr_t)ptr);
-                }
-            } __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
+    for (size_t off = 0; off + 4 <= mpSize; off += 4) {
+        uint32_t v = 0;
+        bool ok = SafeRead32(data + off, v);
+        if (ok && v >= (uint32_t)textLo && v < (uint32_t)textHi) {
+            if (curRun == 0) runStart = off;
+            curRun++;
+        } else {
+            if (curRun >= 50) {
+                // Check for dtor pair
+                uint32_t s0 = 0, s1 = 0;
+                SafeRead32(data + runStart, s0);
+                SafeRead32(data + runStart + 4, s1);
+                VtableCandidate c;
+                c.addr = base + runStart;
+                c.run  = curRun;
+                c.hasDtorPair = (s0 == s1);
+                candidates.push_back(c);
+            }
+            curRun = 0;
         }
-        break; // Only scan first writable section
     }
-    return nullptr;
+
+    // Sort: dtor pairs first, then by run length descending
+    std::sort(candidates.begin(), candidates.end(), [](const VtableCandidate& a, const VtableCandidate& b) {
+        if (a.hasDtorPair != b.hasDtorPair) return a.hasDtorPair > b.hasDtorPair;
+        return a.run > b.run;
+    });
+
+    Log("[FB-Dense] Found %zu dense vtable candidates (run>=50, in mp.dll .text)\n", candidates.size());
+    for (size_t i = 0; i < candidates.size() && i < 10; i++) {
+        uint32_t s0=0,s1=0,s2=0;
+        SafeRead32((void*)candidates[i].addr, s0);
+        SafeRead32((void*)(candidates[i].addr+4), s1);
+        SafeRead32((void*)(candidates[i].addr+8), s2);
+        Log("[FB-Dense]   [%zu] @ 0x%08zX (mp.dll+0x%zX) run=%d dtorPair=%d  s[0..2]=%08X %08X %08X\n",
+            i, candidates[i].addr, candidates[i].addr - base,
+            candidates[i].run, candidates[i].hasDtorPair, s0, s1, s2);
+    }
+
+    // Now narrow down: the frostbite vtable should be near (within 0x200000 of)
+    // the "frostbite" string we know is at mp.dll+0x15D48BC (VA ~0x247148BC)
+    // But that varies per run — use the string search to find a close candidate
+    const char* needle = "frostbite";
+    size_t nlen = strlen(needle);
+    uintptr_t frostbiteStringOff = 0;
+    for (size_t off = 0; off + nlen < mpSize; off++) {
+        if (_strnicmp(reinterpret_cast<char*>(data + off), needle, nlen) == 0) {
+            frostbiteStringOff = off;
+            break;
+        }
+    }
+    Log("[FB-Dense] frostbite string at mp.dll+0x%zX\n", frostbiteStringOff);
+
+    // Among candidates with dtor pair, pick the one whose vtable offset is
+    // within 0x400000 of the frostbite string (same class group)
+    for (auto& c : candidates) {
+        if (!c.hasDtorPair) continue;
+        size_t vtOff = c.addr - base;
+        if (frostbiteStringOff > 0) {
+            size_t dist = (vtOff > frostbiteStringOff)
+                ? (vtOff - frostbiteStringOff)
+                : (frostbiteStringOff - vtOff);
+            if (dist > 0x600000) continue;
+        }
+        Log("[FB-Dense] BEST candidate vtable @ 0x%08zX (mp.dll+0x%zX)  run=%d\n",
+            c.addr, vtOff, c.run);
+        return c.addr;
+    }
+
+    // Fallback: longest run overall
+    if (!candidates.empty()) {
+        Log("[FB-Dense] Fallback: using longest run vtable @ 0x%08zX\n", candidates[0].addr);
+        return candidates[0].addr;
+    }
+
+    Log("[FB-Dense] No vtable candidate found!\n");
+    return 0;
 }
 
-// ---------------------------------------------------------------------------
-// GiveFnptrs_Init
-// ---------------------------------------------------------------------------
-bool GiveFnptrs_Init(HMODULE hMpDll)
-{
-    GLog("[GiveFnptrs] GiveFnptrs_Init starting\n");
+// ─── Engfuncs validation ────────────────────────────────────────────────────
+// In standard HLSDK enginefuncs_s:
+//  index 0  = pfnPrecacheModel
+//  index 1  = pfnPrecacheSound
+//  index 2  = pfnSetModel
+//  index 3  = pfnModelIndex
+//  index 4  = pfnModelFrames
+//  index 5  = pfnSetSize
+//  index 6  = pfnChangeLevel
+//  ...
+//  index 20 = pfnSetOrigin
+//  ...
+//  DispatchSpawn doesn't have a standard engfunc index — it's in gamedll_funcs
+//
+// For our patch we only need pfnSetOrigin (engfuncs[20] in standard HLSDK)
+// Let's verify by checking that engfuncs[20] points into hw.dll
 
-    HMODULE hMp = hMpDll ? hMpDll : GetModuleHandleA("mp.dll");
-    if (!hMp) { GLog("[GiveFnptrs] mp.dll not found\n"); return false; }
+static bool ValidateEngfuncs(enginefuncs_t* ef, uintptr_t hwBase, uintptr_t hwEnd) {
+    auto* ptrs = reinterpret_cast<uint32_t*>(ef);
+    // Check first 5 entries all point into hw.dll
+    int valid = 0;
+    for (int i = 0; i < 5; i++) {
+        uint32_t p = ptrs[i];
+        if (p >= hwBase && p < hwEnd) valid++;
+    }
+    if (valid < 4) return false;
+    // Check pfnSetOrigin (index 20 in standard HLSDK) also points into hw.dll
+    uint32_t setOriginPtr = ptrs[20];
+    return (setOriginPtr >= hwBase && setOriginPtr < hwEnd);
+}
 
-    // hw.dll is the engine — confirmed 02B50000, size 69MB from previous log
-    HMODULE hEngine = GetModuleHandleA("hw.dll");
-    if (!hEngine) hEngine = GetModuleHandleA("swds.dll");
-    if (!hEngine) hEngine = GetModuleHandleA("engine.dll");
-    GLog("[GiveFnptrs] mp.dll=%p  hw.dll=%p\n", hMp, hEngine);
+// ─── Main init ──────────────────────────────────────────────────────────────
 
-    if (!hEngine) {
-        GLog("[GiveFnptrs] FATAL: engine DLL (hw.dll) not found\n");
+bool GiveFnptrs_Init(HMODULE hMp) {
+    Log("[GiveFnptrs] GiveFnptrs_Init starting, mp.dll=0x%08X\n", (uintptr_t)hMp);
+
+    // Locate hw.dll
+    HMODULE hHw = GetModuleHandleA("hw.dll");
+    if (!hHw) { Log("[GiveFnptrs] hw.dll not found!\n"); return false; }
+    auto* hwNt = GetNtHeaders(hHw);
+    if (!hwNt) { Log("[GiveFnptrs] hw.dll NT headers invalid!\n"); return false; }
+    uintptr_t hwBase = reinterpret_cast<uintptr_t>(hHw);
+    uintptr_t hwEnd  = hwBase + hwNt->OptionalHeader.SizeOfImage;
+    Log("[GiveFnptrs] hw.dll @ 0x%08zX  size=0x%X\n", hwBase, hwNt->OptionalHeader.SizeOfImage);
+
+    // ── Find engfuncs in mp.dll ─────────────────────────────────────────
+    auto* mpNt   = GetNtHeaders(hMp);
+    if (!mpNt) { Log("[GiveFnptrs] mp.dll NT headers invalid!\n"); return false; }
+    auto  mpBase = reinterpret_cast<uintptr_t>(hMp);
+    auto  mpSize = mpNt->OptionalHeader.SizeOfImage;
+    auto* mpData = reinterpret_cast<uint8_t*>(mpBase);
+
+    Log("[GiveFnptrs] Scanning mp.dll for engfuncs (looking for 20+ consecutive hw.dll ptrs)...\n");
+
+    struct EngCandidate { size_t offset; int run; };
+    std::vector<EngCandidate> engCandidates;
+
+    int curRun = 0; size_t runStart = 0;
+    for (size_t off = 0; off + 4 <= mpSize; off += 4) {
+        uint32_t v = 0;
+        bool ok = SafeRead32(mpData + off, v);
+        if (ok && v >= (uint32_t)hwBase && v < (uint32_t)hwEnd) {
+            if (curRun == 0) runStart = off;
+            curRun++;
+        } else {
+            if (curRun >= 20) {
+                engCandidates.push_back({runStart, curRun});
+            }
+            curRun = 0;
+        }
+    }
+
+    Log("[GiveFnptrs] Found %zu engfuncs candidates (run>=20)\n", engCandidates.size());
+
+    // Sort by run length descending
+    std::sort(engCandidates.begin(), engCandidates.end(),
+        [](const EngCandidate& a, const EngCandidate& b){ return a.run > b.run; });
+
+    enginefuncs_t* found = nullptr;
+    for (auto& c : engCandidates) {
+        auto* ef = reinterpret_cast<enginefuncs_t*>(mpData + c.offset);
+        auto* ptrs = reinterpret_cast<uint32_t*>(ef);
+        Log("[GiveFnptrs] Candidate @ mp.dll+0x%zX  run=%d  [0]=%08X [1]=%08X [20]=%08X\n",
+            c.offset, c.run, ptrs[0], ptrs[1], ptrs[20]);
+        if (ValidateEngfuncs(ef, hwBase, hwEnd)) {
+            Log("[GiveFnptrs] VALIDATED engfuncs @ mp.dll+0x%zX\n", c.offset);
+            // Dump first 30 for diagnostics
+            for (int i = 0; i < 30 && i < c.run; i++) {
+                Log("[GiveFnptrs]   [%2d] 0x%08X\n", i, ptrs[i]);
+            }
+            found = ef;
+            break;
+        }
+    }
+
+    if (!found) {
+        Log("[GiveFnptrs] No valid engfuncs table found!\n");
         return false;
     }
 
-    // ------------------------------------------------------------------
-    // APPROACH 1: Scan mp.dll .data for the already-filled engfuncs table.
-    // The engine called GiveFnptrsToDll(mp) before we got here, so the
-    // table is already populated — we just need to find it.
-    // ------------------------------------------------------------------
-    GLog("[GiveFnptrs] === APPROACH 1: scan mp.dll .data for engfuncs table ===\n");
-    enginefuncs_t* found = nullptr;
-    __try {
-        found = FindEngfuncsInMpDll(hMp, hEngine);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        GLog("[GiveFnptrs] SEH in FindEngfuncsInMpDll\n");
-    }
+    g_engfuncs = *found;
 
-    if (found) {
-        g_engfuncs = found;
-        GLog("[GiveFnptrs] engfuncs found via scan: %p\n", found);
+    // Log key functions
+    auto* ptrs = reinterpret_cast<uint32_t*>(&g_engfuncs);
+    Log("[GiveFnptrs] pfnSetOrigin (index 20) = 0x%08X\n", ptrs[20]);
+    Log("[GiveFnptrs] engfuncs SUCCESS\n");
 
-        // Find globals
+    // ── Find g_globals ──────────────────────────────────────────────────
+    // g_globals is a globalvars_t* — search mp.dll .data for a ptr where
+    // time >= 0 and frametime >= 0 and maxClients in [1..64]
+    Log("[GiveFnptrs] Scanning for g_globals...\n");
+    for (size_t off = 0; off + sizeof(void*) <= mpSize; off += 4) {
+        uint32_t ptrVal = 0;
+        if (!SafeRead32(mpData + off, ptrVal)) continue;
+        if (ptrVal < 0x10000 || ptrVal > 0x7FFFFFFF) continue;
         __try {
-            g_globals = FindGlobalsInMpDll(hMp, found);
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            GLog("[GiveFnptrs] SEH in FindGlobalsInMpDll\n");
-        }
-        GLog("[GiveFnptrs] g_globals = %p\n", g_globals);
-        GLog("[GiveFnptrs] SUCCESS via scan\n");
-        return true;
+            auto* g = reinterpret_cast<globalvars_t*>(ptrVal);
+            if (g->maxClients >= 1 && g->maxClients <= 64 &&
+                g->time >= 0.0f && g->frametime >= 0.0f && g->frametime < 1.0f) {
+                Log("[GiveFnptrs] g_globals = 0x%08X  (time=%.3f  maxClients=%d)\n",
+                    ptrVal, g->time, g->maxClients);
+                g_pGlobals = g;
+                break;
+            }
+        } __except(EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    if (!g_pGlobals) {
+        Log("[GiveFnptrs] WARNING: g_globals not found, continuing anyway\n");
     }
 
-    // ------------------------------------------------------------------
-    // APPROACH 2: Dump the GiveFnptrsToDll function bytes in mp.dll
-    // so we can see what it actually does and reverse it properly.
-    // Also dump mp.dll exports related to engine funcs.
-    // ------------------------------------------------------------------
-    GLog("[GiveFnptrs] === APPROACH 2: diagnostic dump ===\n");
+    return true;
+}
 
-    FARPROC pfnGive = SafeGetExport(hMp, "GiveFnptrsToDll");
-    GLog("[GiveFnptrs] GiveFnptrsToDll in mp.dll @ %p\n", pfnGive);
-    if (pfnGive) DumpFuncBytes((void*)pfnGive, "GiveFnptrsToDll", 64);
-
-    // Also look for GetEntityAPI, GetNewDLLFunctions — common mp.dll exports
-    // that receive engine funcs via different paths
-    const char* interestingExports[] = {
-        "GetEntityAPI", "GetEntityAPI2", "GetNewDLLFunctions",
-        "Server_GetPhysicsInterface",
-        nullptr
-    };
-    for (int i = 0; interestingExports[i]; ++i) {
-        FARPROC fn = SafeGetExport(hMp, interestingExports[i]);
-        if (fn) {
-            GLog("[GiveFnptrs] mp.dll exports '%s' @ %p\n", interestingExports[i], fn);
-            DumpFuncBytes((void*)fn, interestingExports[i], 32);
-        }
-    }
-
-    // Dump mp.dll export list (first 60)
-    __try {
-        auto* base = reinterpret_cast<uint8_t*>(hMp);
-        auto* dos  = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
-        auto* nt   = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
-        auto& ed   = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
-        auto* exp  = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(base + ed.VirtualAddress);
-        auto* nams = reinterpret_cast<DWORD*>(base + exp->AddressOfNames);
-        DWORD cnt  = exp->NumberOfNames < 60 ? exp->NumberOfNames : 60;
-        GLog("[GiveFnptrs] mp.dll has %lu exports, first %lu:\n", exp->NumberOfNames, cnt);
-        for (DWORD k = 0; k < cnt; ++k)
-            GLog("[GiveFnptrs]   [%3lu] %s\n", k,
-                 reinterpret_cast<const char*>(base + nams[k]));
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        GLog("[GiveFnptrs] SEH dumping mp.dll exports\n");
-    }
-
-    GLog("[GiveFnptrs] FATAL: could not find engfuncs — need diagnostic output above\n");
-    return false;
+uintptr_t FindWeaponFrostbiteVtable(HMODULE hMp) {
+    return FindFrostbiteVtable(hMp);
 }
