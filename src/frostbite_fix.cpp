@@ -1,14 +1,16 @@
-// frostbite_fix.cpp  v14
+// frostbite_fix.cpp  v15
 //
-// DIAGNOSTIC: patch BOTH vtables and log which one fires.
+// Same dual-vtable diagnostic as v14, but with FIXED globals resolution.
+// v14 showed t=0.00 always because GiveFnptrs_Init was grabbing the wrong
+// globals pointer via heuristic scan. v15 uses GiveFnptrsToDll disassembly
+// to find the real gpGlobals, and refreshes it on every hook call.
 //
 // From IDA (client mp.dll, imagebase 0x10000000):
 //   const CFrostbite::vftable           @ 0x115D4C80  RVA 0x015D4C80
 //   const CSimpleWpn<CFrostbite>::vftable @ 0x115D48CC  RVA 0x015D48CC
 //
-// v13 proved hooks installed in CFrostbite vtable never fired.
-// Hypothesis: weapon is instantiated as CSimpleWpn<CFrostbite> not CFrostbite,
-// so the game routes through the CSimpleWpn vtable instead.
+// v14 confirmed: CSimpleWpn<CFrostbite> vtable (vtbl1) is the active one.
+// Slot map confirmed correct from IDA dump (165-194 all <<<FB).
 //
 // v14: patch slots 165-194 in BOTH vtables with call-throughs,
 // log which vtable fires first.
@@ -28,7 +30,11 @@ static inline T& Field(void* base, int off)
     return *reinterpret_cast<T*>(reinterpret_cast<uint8_t*>(base) + off);
 }
 
-static float NOW() { return g_pGlobals ? g_pGlobals->time : 0.0f; }
+static float NOW()
+{
+    GiveFnptrs_RefreshGlobals();
+    return g_pGlobals ? g_pGlobals->time : 0.0f;
+}
 
 // Vtable RVAs (client imagebase 0x10000000)
 static const uintptr_t kRVA_FB_Vtable     = 0x015D4C80;  // CFrostbite

@@ -45,3 +45,4 @@ extern enginefuncs_t  g_engfuncs;
 extern globalvars_t*  g_pGlobals;
 
 bool GiveFnptrs_Init(HMODULE hMp);
+void GiveFnptrs_RefreshGlobals();  // call each frame to keep g_pGlobals current
