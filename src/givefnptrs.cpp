@@ -1,4 +1,5 @@
 #include "givefnptrs.h"
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 
