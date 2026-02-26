@@ -464,16 +464,25 @@ static bool ApplyPatches()
     }
 
     Log("[FB] Weapon vtable at %p — dumping first 16 slots before patching:\n", g_pWeaponVtable);
-    for (int i = 0; i < 16; ++i)
-        Log("[FB]   vtable[%2d] = %p\n", i, g_pWeaponVtable[i]);
+    __try {
+        for (int i = 0; i < 16; ++i)
+            Log("[FB]   vtable[%2d] = %p\n", i, g_pWeaponVtable[i]);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("[FB] SEH reading vtable slots — ptr %p is invalid!\n", g_pWeaponVtable);
+        return false;
+    }
 
     bool ok = true;
-    ok &= PatchSlot(g_pWeaponVtable, FBSlots::Slot_PrimaryAttack,   (void*)Hook_PrimaryAttack);
-    ok &= PatchSlot(g_pWeaponVtable, FBSlots::Slot_SecondaryAttack, (void*)Hook_SecondaryAttack);
-    ok &= PatchSlot(g_pWeaponVtable, FBSlots::Slot_Holster,         (void*)Hook_Holster);
-
-    if (g_pPropVtable)
-        ok &= PatchSlot(g_pPropVtable, FBSlots::Slot_Think, (void*)Hook_Think);
+    __try {
+        ok &= PatchSlot(g_pWeaponVtable, FBSlots::Slot_PrimaryAttack,   (void*)Hook_PrimaryAttack);
+        ok &= PatchSlot(g_pWeaponVtable, FBSlots::Slot_SecondaryAttack, (void*)Hook_SecondaryAttack);
+        ok &= PatchSlot(g_pWeaponVtable, FBSlots::Slot_Holster,         (void*)Hook_Holster);
+        if (g_pPropVtable)
+            ok &= PatchSlot(g_pPropVtable, FBSlots::Slot_Think, (void*)Hook_Think);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("[FB] SEH during vtable patching — bad pointer or protected page\n");
+        return false;
+    }
 
     Log("[FB] Patches: %s\n", ok ? "ALL OK" : "PARTIAL FAILURE");
     return ok;
@@ -497,7 +506,12 @@ bool FrostbiteFix_Init(HMODULE hMpDll)
     ResolveEngineHelpers();
 
     // Step 2 — find frostbite vtable
-    g_pWeaponVtable = reinterpret_cast<void**>(FindWeaponVtable(hMpDll));
+    __try {
+        g_pWeaponVtable = reinterpret_cast<void**>(FindWeaponVtable(hMpDll));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("[FB] SEH in FindWeaponVtable — mp.dll scan crashed!\n");
+        return false;
+    }
     if (!g_pWeaponVtable) {
         Log("[FB] FATAL: weapon vtable not found\n");
         return false;
