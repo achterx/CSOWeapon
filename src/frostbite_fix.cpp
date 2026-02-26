@@ -1,50 +1,36 @@
-// frostbite_fix.cpp  v17
+// frostbite_fix.cpp  v18
 //
-// Complete reimplementation based on IDA decompilation of client mp.dll.
-// Every offset, every call, every constant is taken directly from the dump.
+// Hook the weapon_frostbite entity factory (sub_10B3AD50).
+// This is called by the engine every time it spawns a weapon_frostbite entity.
+// We intercept it, call the original, then fix up the resulting object.
 //
-// KEY INSIGHT from logs: the server already has all Frostbite functions
-// correctly wired in the vtable. The functions exist and run. The problem
-// is gpGlobals->time = 0 because we patch too early. The fix is in dllmain
-// (wait for gpGlobals != 0), NOT in reimplementing functions.
+// From IDA decompile of weapon_frostbite (sub_10B3AD50):
+//   void __cdecl weapon_frostbite(int edict)
+//   {
+//     if (!edict) edict = CreateEntityByName() + 132
+//     v3 = *(edict + 568)   // entvars_t*
+//     if (!v3 || !*(v3+128))
+//     {
+//       obj = ALLOC(v3, 536)          // dword_11E51988 = pfnPvAllocEntPrivateData
+//       if (obj)
+//         *(sub_10B31450(obj) + 8) = edict  // construct CFrostbite, link edict
+//     }
+//   }
 //
-// BUT: AddToPlayer is broken — it receives weaponID (597) instead of a
-// player pointer. This is because sub_10B30FE0 has a special first-arg
-// check: if a2==0, use this->weaponID. The call site passes 597 correctly.
-// We need to verify the config lookup works on server.
+// sub_10B31450 = CFrostbite constructor (returns this ptr)
+// Object size = 536 bytes
+// Object+8 = edict ptr
 //
-// This version: minimal targeted patches only.
-// - Do NOT replace PrimaryAttack, WeaponIdle, Think, PropThink (all work)
-// - ONLY fix SecondaryAttack cooldown check (uses gpGlobals->time)
-// - Fix AddToPlayer to handle the weaponID-as-arg calling convention
+// The factory table at RVA 0x1856C48 holds a ptr to weapon_frostbite.
+// We patch that ptr to point to our hook.
 //
-// All offsets confirmed from IDA decompilation (client mp.dll, base 0x10000000):
+// gpGlobals: dword_11E51BCC is a pointer to gpGlobals struct.
+// gpGlobals->time is at offset 0 of that struct.
+// So: time = *(float*)(*(uint32_t*)(mp + 0x1E51BCC))
 //
-// Weapon object (CBasePlayerWeapon / CFrostbite) field layout:
-//   +0x034 (this+13)  = vtable ptr [0] check
-//   +0x0D0 (this+52)  = m_pPlayer ptr
-//   +0x0E4 (this+57)  = m_iId (weapon ID = 597)
-//   +0x14C (this+83)  = m_iPrimaryAmmoType
-//   +0x154 (this+85)  = ammo count
-//   +0x15C (this+87)  = m_iClip (zeroed in Holster)
-//   +0x13C (this+79)  = m_flNextPrimaryAttack (also NextAttack cooldown)
-//   +0x18C (this+99)  = m_flTimeWeaponIdle
-//   +0x194 (this+101) = shot counter
-//   +0x1D8 (this+118) = config ID (set in AddToPlayer)
-//   +0x1EC (this+123) = m_iDefaultAmmo (zeroed in Holster)
-//   +0x1E8 (this+244 as _WORD) = m_usFireFrostbite event handle
-//   +0x1FC (this+127) = charge state float (shield active until time)
-//   +0x204 (this+129) = secondary state
-//   +0x18C (this+396 as float*) = idle multiplier
-//
-// gpGlobals (dword_11E51BCC): current time pointer
-// sub_1058A0B0 = UTIL_WeaponTimeBase()
-// sub_10576750 = RANDOM_FLOAT(0)  -- actually gpGlobals->time
-// sub_10576870 = GetWeaponConfig("name")
-// sub_10576FB0 = CBasePlayerWeapon::AddToPlayer base
-// sub_10B37470 = FireProjectile (called from WeaponIdle)
-// sub_1131AEC0 = SendWeaponAnim
-// sub_1058A0B0 = UTIL_WeaponTimeBase
+// SecondaryAttack (sub_10B30F60) uses *(float*)dword_11E51BCC for time.
+// This means dword_11E51BCC stores a float* that points to gpGlobals->time.
+// We read it fresh on every call.
 
 #include <windows.h>
 #include <cstdint>
@@ -52,144 +38,99 @@
 #include "givefnptrs.h"
 #include "logger.h"
 
-// ---------------------------------------------------------------------------
-// Field accessor
-// ---------------------------------------------------------------------------
 template<typename T>
-static inline T& F(void* base, int byteOff)
+static inline T& F(void* base, int off)
 {
-    return *reinterpret_cast<T*>(reinterpret_cast<uint8_t*>(base) + byteOff);
+    return *reinterpret_cast<T*>(reinterpret_cast<uint8_t*>(base) + off);
 }
 
 // ---------------------------------------------------------------------------
-// Function pointers resolved at init from mp.dll RVAs
+// Globals
 // ---------------------------------------------------------------------------
-static uintptr_t g_mpBase = 0;
+static uintptr_t g_mpBase  = 0;
 static bool      g_patched = false;
 
-// Original function pointers (saved before patching)
-static uintptr_t g_orig_SecondaryAttack = 0;
-static uintptr_t g_orig_AddToPlayer     = 0;
+// RVAs from IDA
+static const uintptr_t RVA_factory_fn    = 0x0B3AD50;  // weapon_frostbite()
+static const uintptr_t RVA_factory_table = 0x1856C48;  // table entry ptr to fn
+static const uintptr_t RVA_factory_tab2  = 0x18595A8;  // second table entry
+static const uintptr_t RVA_pTimePtr      = 0x1E51BCC;  // dword holding float* to time
+static const uintptr_t RVA_vtbl_simple   = 0x15D48CC;  // CSimpleWpn<CFrostbite> vtable
+static const uintptr_t RVA_SecondaryAtk  = 0x0B30F60;  // sub_10B30F60
+static const uintptr_t RVA_WTB           = 0x058A0B0;  // UTIL_WeaponTimeBase
 
-// mp.dll function RVAs (confirmed from IDA)
-#define RVA_WTB          0x58A0B0   // UTIL_WeaponTimeBase()
-#define RVA_GPGLOBALS    0x1E51BCC  // pointer to gpGlobals->time (dword_11E51BCC)
-#define RVA_GetConfig    0x576870   // GetWeaponConfig(const char*)
-#define RVA_BaseATP      0x576FB0   // CBasePlayerWeapon::AddToPlayer(player)
-#define RVA_VTBL_Simple  0x15D48CC  // CSimpleWpn<CFrostbite>::vftable
-
-typedef float  (__cdecl*    pfnWTB_t)();
-typedef void*  (__cdecl*    pfnGetConfig_t)(const char*);
-typedef int    (__thiscall* pfnBaseATP_t)(void*, void*);
-
-static pfnWTB_t       g_WTB       = nullptr;
-static pfnGetConfig_t g_GetConfig = nullptr;
-static pfnBaseATP_t   g_BaseATP   = nullptr;
-static float*         g_pTime     = nullptr;  // points directly to gpGlobals->time
+typedef float(__cdecl* pfnWTB_t)();
+static pfnWTB_t g_WTB = nullptr;
 
 static float NOW()
 {
-    // gpGlobals->time is at dword_11E51BCC which holds the pointer,
-    // but dword_11E51BCC IS gpGlobals->time directly (it's a global float ptr
-    // that IDA shows as a dword — the value AT that address IS the time float).
-    // Actually from decompile: *(float*)dword_11E51BCC is how time is read.
-    // dword_11E51BCC = &gpGlobals->time — it's a pointer to the float.
-    if (!g_pTime) return 0.0f;
+    // *(float*)(*(uint32_t*)(mp + RVA_pTimePtr))
+    uintptr_t addr = g_mpBase + RVA_pTimePtr;
+    uint32_t inner = 0;
+    __try { inner = *reinterpret_cast<uint32_t*>(addr); }
+    __except(EXCEPTION_EXECUTE_HANDLER) { return 0.0f; }
+    if (!inner) return 0.0f;
     float t = 0.0f;
-    __try { t = *g_pTime; } __except(EXCEPTION_EXECUTE_HANDLER) {}
+    __try { t = *reinterpret_cast<float*>((uintptr_t)inner); }
+    __except(EXCEPTION_EXECUTE_HANDLER) { return 0.0f; }
     return t;
 }
 
 // ---------------------------------------------------------------------------
-// HOOK: SecondaryAttack (slot 168)
-//
-// From decompile of sub_10B30F60:
-//   call base SecondaryAttack (vtable+648)
-//   v8 = UTIL_WeaponTimeBase()
-//   if (this+79 <= v8):   <-- nextAttack check
-//     this+79 = WTB() + 80.3
-//     v5 = (this+127 > gpGlobals->time)   <-- charged?
-//     v7 = vtable+688(this)               <-- HasShield
-//     param = v5 ? 6 : 0
-//     vtable+652(this, param, v7)          <-- DeployShield
+// Original factory function (called via trampoline)
 // ---------------------------------------------------------------------------
-static void __fastcall Hook_SecondaryAttack(void* wpn, void* /*edx*/)
+typedef void(__cdecl* pfnFactory_t)(int);
+static pfnFactory_t g_origFactory = nullptr;
+
+// Trampoline bytes (first 5 bytes of original fn, then JMP back)
+static uint8_t g_trampoline[16] = {};
+
+// ---------------------------------------------------------------------------
+// SecondaryAttack hook — only patches the cooldown time source
+// Original sub_10B30F60 uses *(float*)dword_11E51BCC for time comparison.
+// If that ptr is valid, SecondaryAttack works natively. We don't need to
+// reimplement it — we just need time to be non-zero when it runs.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Our weapon_frostbite factory hook
+// Called instead of the real weapon_frostbite(int edict)
+// ---------------------------------------------------------------------------
+static void __cdecl Hook_WeaponFrostbiteFactory(int edict)
 {
-    float t   = g_WTB ? g_WTB() : NOW();
-    float now = NOW();
+    Log("[FB] Hook_WeaponFrostbiteFactory edict=%d t=%.3f\n", edict, NOW());
 
-    float nextAtk = F<float>(wpn, 0x13C);
-    float charge  = F<float>(wpn, 0x1FC);
+    // Call original via trampoline
+    if (g_origFactory)
+        g_origFactory(edict);
 
-    Log("[FB] SecondaryAttack wpn=%p nextAtk=%.2f t=%.2f now=%.2f charge=%.2f\n",
-        wpn, nextAtk, t, now, charge);
-
-    // Call base SecondaryAttack first (vtable slot 162 = vtable+648/4)
-    typedef void(__thiscall* Fn)(void*);
-    void** vtbl = *reinterpret_cast<void***>(wpn);
-    reinterpret_cast<Fn>(vtbl[162])(wpn);
-
-    // Cooldown check
-    if (nextAtk > t) {
-        Log("[FB] SecondaryAttack blocked by cooldown (%.2f > %.2f)\n", nextAtk, t);
-        return;
-    }
-
-    // Set cooldown
-    F<float>(wpn, 0x13C) = t + 80.299995f;
-
-    // Check charge state
-    bool charged = (charge > now);
-
-    // HasShield check (vtable slot 172 = vtable+688/4)
-    typedef int(__thiscall* HasShield_t)(void*);
-    int hasShield = reinterpret_cast<HasShield_t>(vtbl[172])(wpn);
-
-    // Deploy shield (vtable slot 163 = vtable+652/4)
-    int param = charged ? 6 : 0;
-    typedef void(__thiscall* Deploy_t)(void*, int, int);
-    reinterpret_cast<Deploy_t>(vtbl[163])(wpn, param, hasShield);
-
-    Log("[FB] SecondaryAttack fired charged=%d hasShield=%d param=%d\n",
-        (int)charged, hasShield, param);
-}
-
-// ---------------------------------------------------------------------------
-// HOOK: AddToPlayer (slot 175)
-//
-// From decompile of sub_10B30FE0:
-//   if (!a2) a2 = this+57  (weaponID fallback)
-//   v4 = *(GetWeaponConfig("FROSTBITE") + 36)
-//   this+118 = v4->vtable[2](v4)   (get config ID)
-//   return BaseAddToPlayer(a2, 0)
-//
-// The log shows player=0x255 (=597) being passed — this is the weaponID
-// being used as the player arg in the server's calling convention.
-// The original function handles this with the "if(!a2) a2=this->id" check.
-// We just call the original and log what happens.
-// ---------------------------------------------------------------------------
-static int __fastcall Hook_AddToPlayer(void* wpn, void* /*edx*/, void* pPlayer)
-{
-    Log("[FB] AddToPlayer wpn=%p player=%p cfgId_before=%d\n",
-        wpn, pPlayer, F<int>(wpn, 0x1D8));
-
-    // Call original
-    typedef int(__thiscall* Fn)(void*, void*);
-    int ret = reinterpret_cast<Fn>(g_orig_AddToPlayer)(wpn, pPlayer);
-
-    Log("[FB] AddToPlayer DONE ret=%d cfgId=%d evHdl=%d\n",
-        ret, F<int>(wpn, 0x1D8), (int)F<uint16_t>(wpn, 0x1E8));
-    return ret;
+    Log("[FB] Factory complete\n");
 }
 
 // ---------------------------------------------------------------------------
 // Memory helpers
 // ---------------------------------------------------------------------------
-static bool SafeWrite(uintptr_t addr, uintptr_t val)
+static bool SafeWrite(uintptr_t addr, const void* data, size_t len)
+{
+    DWORD old = 0;
+    if (!VirtualProtect((void*)addr, len, PAGE_EXECUTE_READWRITE, &old))
+        return false;
+    memcpy((void*)addr, data, len);
+    VirtualProtect((void*)addr, len, old, &old);
+    return true;
+}
+
+static bool SafeRead32(uintptr_t addr, uint32_t& out)
+{
+    __try { out = *reinterpret_cast<uint32_t*>(addr); return true; }
+    __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+static bool SafeWrite32(uintptr_t addr, uint32_t val)
 {
     DWORD old = 0;
     if (!VirtualProtect((void*)addr, 4, PAGE_EXECUTE_READWRITE, &old)) return false;
-    __try { *(uintptr_t*)addr = val; }
+    __try { *reinterpret_cast<uint32_t*>(addr) = val; }
     __except(EXCEPTION_EXECUTE_HANDLER) {
         VirtualProtect((void*)addr, 4, old, &old);
         return false;
@@ -198,10 +139,13 @@ static bool SafeWrite(uintptr_t addr, uintptr_t val)
     return true;
 }
 
-static bool SafeRead(uintptr_t addr, uintptr_t& out)
+// Write a 32-bit relative JMP at `from` to `to`
+static bool WriteJmp(uintptr_t from, uintptr_t to)
 {
-    __try { out = *(uintptr_t*)addr; return true; }
-    __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+    uint8_t jmp[5];
+    jmp[0] = 0xE9;
+    *reinterpret_cast<int32_t*>(jmp + 1) = (int32_t)(to - from - 5);
+    return SafeWrite(from, jmp, 5);
 }
 
 // ---------------------------------------------------------------------------
@@ -209,72 +153,82 @@ static bool SafeRead(uintptr_t addr, uintptr_t& out)
 // ---------------------------------------------------------------------------
 bool FrostbiteFix_Init(HMODULE hMp)
 {
-    Log("\n=== FrostbiteFix_Init v17 === mp.dll=0x%08X\n", (uintptr_t)hMp);
+    Log("\n=== FrostbiteFix_Init v18 === mp.dll=0x%08X t=%.3f\n",
+        (uintptr_t)hMp, NOW());
 
     if (g_patched) { Log("[FB] already patched\n"); return true; }
 
     if (!GiveFnptrs_Init(hMp)) {
-        Log("[FB] FATAL: GiveFnptrs_Init failed\n");
+        Log("[FB] GiveFnptrs_Init failed\n");
         return false;
     }
 
     g_mpBase = (uintptr_t)hMp;
+    g_WTB    = (pfnWTB_t)(g_mpBase + RVA_WTB);
 
-    // Resolve function pointers
-    g_WTB       = (pfnWTB_t)      (g_mpBase + RVA_WTB);
-    g_GetConfig = (pfnGetConfig_t) (g_mpBase + RVA_GetConfig);
-    g_BaseATP   = (pfnBaseATP_t)   (g_mpBase + RVA_BaseATP);
+    float t = NOW();
+    Log("[FB] NOW()=%.3f  WTB()=%.3f\n", t, g_WTB());
 
-    // gpGlobals->time: dword_11E51BCC holds the address of gpGlobals,
-    // and time is the first field. So *(float*)(*(uintptr_t*)(mp+RVA)) = time.
-    // Actually from decompile "*(float*)dword_11E51BCC" means the dword IS the ptr.
-    // Read it:
-    {
-        uintptr_t timePtr = 0;
-        SafeRead(g_mpBase + RVA_GPGLOBALS, timePtr);
-        if (timePtr) {
-            g_pTime = reinterpret_cast<float*>(timePtr);
-            Log("[FB] gpGlobals->time ptr = 0x%08zX  current=%.3f\n",
-                timePtr, *g_pTime);
-        } else {
-            // dword_11E51BCC might BE the time value directly (not a pointer)
-            // Try reading it as a pointer to globalvars_t
-            uintptr_t ppg = g_mpBase + RVA_GPGLOBALS;
-            g_pTime = reinterpret_cast<float*>(ppg);
-            Log("[FB] gpGlobals->time direct @ 0x%08zX\n", ppg);
-        }
-    }
+    // --- Patch factory table entry ---
+    // The table at RVA_factory_table holds a ptr to weapon_frostbite fn.
+    // We replace that ptr with our hook.
+    uintptr_t factoryFn   = g_mpBase + RVA_factory_fn;
+    uintptr_t tableEntry1 = g_mpBase + RVA_factory_table;
+    uintptr_t tableEntry2 = g_mpBase + RVA_factory_tab2;
 
-    Log("[FB] WTB=0x%08zX GetConfig=0x%08zX BaseATP=0x%08zX\n",
-        (uintptr_t)g_WTB, (uintptr_t)g_GetConfig, (uintptr_t)g_BaseATP);
-    Log("[FB] NOW()=%.3f  WTB()=%.3f\n", NOW(), g_WTB ? g_WTB() : -1.0f);
+    uint32_t cur1 = 0, cur2 = 0;
+    SafeRead32(tableEntry1, cur1);
+    SafeRead32(tableEntry2, cur2);
+    Log("[FB] factory table[0] @ 0x%08zX = 0x%08X (expected 0x%08zX)\n",
+        tableEntry1, cur1, factoryFn);
+    Log("[FB] factory table[1] @ 0x%08zX = 0x%08X\n", tableEntry2, cur2);
 
-    // Locate CSimpleWpn<CFrostbite> vtable
-    uintptr_t vtbl = g_mpBase + RVA_VTBL_Simple;
-    uintptr_t s0 = 0;
-    if (!SafeRead(vtbl, s0)) {
-        Log("[FB] FATAL: cannot read vtable @ 0x%08zX\n", vtbl);
+    // Build trampoline: copy first 5 bytes of original fn, then JMP back
+    uint8_t orig5[5];
+    __try { memcpy(orig5, (void*)factoryFn, 5); }
+    __except(EXCEPTION_EXECUTE_HANDLER) {
+        Log("[FB] FATAL: cannot read factory fn bytes\n");
         return false;
     }
-    Log("[FB] vtable @ 0x%08zX slot[0]=0x%08zX\n", vtbl, s0);
+    Log("[FB] factory fn first bytes: %02X %02X %02X %02X %02X\n",
+        orig5[0], orig5[1], orig5[2], orig5[3], orig5[4]);
 
-    // Only patch SecondaryAttack (168) — everything else works
-    // (PrimaryAttack, WeaponIdle, Think, PropThink, Holster all function correctly
-    //  once gpGlobals->time is non-zero)
-    uintptr_t saAddr = vtbl + 168 * 4;
-    SafeRead(saAddr, g_orig_SecondaryAttack);
-    Log("[FB] SecondaryAttack orig=0x%08zX\n", g_orig_SecondaryAttack);
-    if (SafeWrite(saAddr, (uintptr_t)Hook_SecondaryAttack))
-        Log("[FB] SecondaryAttack patched OK\n");
-    else
-        Log("[FB] SecondaryAttack patch FAILED\n");
+    // Allocate executable trampoline
+    void* trampolineMem = VirtualAlloc(nullptr, 32,
+        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!trampolineMem) {
+        Log("[FB] FATAL: VirtualAlloc for trampoline failed\n");
+        return false;
+    }
+    // trampoline: [orig 5 bytes] [JMP factoryFn+5]
+    uint8_t* tb = reinterpret_cast<uint8_t*>(trampolineMem);
+    memcpy(tb, orig5, 5);
+    tb[5] = 0xE9;
+    *reinterpret_cast<int32_t*>(tb + 6) =
+        (int32_t)((factoryFn + 5) - ((uintptr_t)tb + 5 + 5));
 
-    // Also hook AddToPlayer for diagnostics only (calls original)
-    uintptr_t atpAddr = vtbl + 175 * 4;
-    SafeRead(atpAddr, g_orig_AddToPlayer);
-    Log("[FB] AddToPlayer orig=0x%08zX\n", g_orig_AddToPlayer);
-    if (SafeWrite(atpAddr, (uintptr_t)Hook_AddToPlayer))
-        Log("[FB] AddToPlayer patched OK\n");
+    g_origFactory = reinterpret_cast<pfnFactory_t>(trampolineMem);
+    Log("[FB] trampoline @ %p\n", trampolineMem);
+
+    // Patch the factory fn with JMP to our hook
+    if (WriteJmp(factoryFn, (uintptr_t)Hook_WeaponFrostbiteFactory)) {
+        Log("[FB] factory fn patched with JMP to hook\n");
+    } else {
+        Log("[FB] FAILED to patch factory fn\n");
+        VirtualFree(trampolineMem, 0, MEM_RELEASE);
+        return false;
+    }
+
+    // Also patch the table entries to point directly to our hook
+    // (in case engine uses the table ptr directly, not the fn)
+    if (cur1 == (uint32_t)factoryFn) {
+        SafeWrite32(tableEntry1, (uint32_t)(uintptr_t)Hook_WeaponFrostbiteFactory);
+        Log("[FB] table[0] patched\n");
+    }
+    if (cur2 == (uint32_t)factoryFn) {
+        SafeWrite32(tableEntry2, (uint32_t)(uintptr_t)Hook_WeaponFrostbiteFactory);
+        Log("[FB] table[1] patched\n");
+    }
 
     g_patched = true;
     Log("=== FrostbiteFix_Init COMPLETE ===\n");
