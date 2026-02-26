@@ -2,8 +2,11 @@
 #include "givefnptrs.h"
 #include "pattern_scan.h"
 
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
+#include <cstdint>
 #include <cstdio>
 #include <cmath>
 #include <cstring>
@@ -427,10 +430,13 @@ static int __fastcall Hook_PrimaryAttack(void* ecx, void* /*edx*/)
                 direction[2] /= len;
             }
 
-            SpawnFrostbiteProjectile(spawnOrigin, direction, PROJ_SPEED,
-                /* ownerEdictIndex — pfnIndexOfEdict(playerPev's edict) */
-                reinterpret_cast<int(*)(entvars_t*)>(
-                    g_engfuncs->pfnEntOffsetOfPEntity)(playerPev));
+            // ownerEdictIndex: walk from pev back to edict_t.
+            // edict_t layout: [free:4][freetime:4][pvServerData:4][entvars_t v]
+            // So edict = (uint8_t*)pev - 12
+            uint8_t* pEdictBytes = reinterpret_cast<uint8_t*>(playerPev) - 12;
+            int ownerIdx = reinterpret_cast<int(__cdecl*)(const void*)>(
+                g_engfuncs->pfnIndexOfEdict)(pEdictBytes);
+            SpawnFrostbiteProjectile(spawnOrigin, direction, PROJ_SPEED, ownerIdx);
         }
     }
 
@@ -522,8 +528,10 @@ static void __fastcall Hook_Think(void* ecx, void* /*edx*/)
 
         // Team check — if team == 6, reset think immediately
         if (player) {
-            void** playerPev = *reinterpret_cast<void***>(*reinterpret_cast<void**>(player + 8) + 584);
-            // simplified: just reset next think
+            // can't do arithmetic on void* — cast through uintptr_t
+            uintptr_t pevPtr = *reinterpret_cast<uintptr_t*>(
+                *reinterpret_cast<uintptr_t*>(reinterpret_cast<uintptr_t>(player) + 8) + 584);
+            (void)pevPtr; // simplified: just reset next think
             MEMBER(float, self, FB::m_flNextThink) = NOW();
         }
     }
