@@ -1,43 +1,39 @@
-// frostbite_fix.cpp  v8
+// frostbite_fix.cpp  v9
 //
-// ROOT CAUSE (confirmed via IDA):
-//   CFrostbite::Precache() = nullsub_2 (empty function, just ret).
-//   The weapon never calls pfnPrecacheModel / pfnPrecacheSound for any of
-//   its assets.  When the engine tries to use the model or play a sound
-//   that was never precached -> crash.
+// ROOT CAUSE (confirmed via mp.dll analysis):
+//   sub_5897F0 (the CFrostbite Precache function called from the CSNZ weapon
+//   descriptor table via sub_802AE0) is a stub: C2 08 00 = RETN 8.
+//   It never calls pfnPrecacheModel/Sound for any of the 21 frostbite assets.
+//   sub_802AE0 calls this stub directly (not through the vtable), so patching
+//   the vtable has no effect.
 //
 // FIX:
-//   Patch vtable slot 2 (Precache) at RVA 0x15D4C88 to point to our
-//   FrostbitePrecache() stub which precaches all 22 known assets.
-//   All asset strings are read directly from mp.dll .rdata using their
-//   confirmed RVAs so we never hardcode heap pointers.
+//   Overwrite the stub at mp.dll+0x5897F0 with a JMP to our FrostbitePrecache.
+//   The stub has 16 bytes total (3 bytes RETN8 + 13 bytes CC padding), giving us
+//   room for a full absolute JMP trampoline (PUSH addr; RET = 6 bytes).
+//   Our hook precaches all 21 known frostbite assets then does RETN 8 itself.
+//
+// All RVAs confirmed from IDA (imagebase 0x10000000).
 
 #include <windows.h>
 #include <cstdint>
-#include <psapi.h>
+#include <cstring>
 #include "givefnptrs.h"
 #include "logger.h"
 
-#pragma comment(lib, "psapi.lib")
-
 // ---------------------------------------------------------------------------
-// Confirmed RVAs from IDA (imagebase 0x10000000)
+// Confirmed RVAs from IDA
 // ---------------------------------------------------------------------------
+static const DWORD kRVA_PrecacheStub = 0x5897F0;  // C2 08 00 stub, called from sub_802AE0
 
-// vtable slot 2 = Precache(), currently nullsub_2
-static const DWORD kVtable_CFrostbite   = 0x15D4C80;  // vtable base
-static const DWORD kSlot_Precache       = 2;           // slot index
-
-// Asset string RVAs — all confirmed in IDA strings window
+// Asset RVAs (all confirmed in IDA strings window)
 static const DWORD kAssetRVAs[] = {
-    // models
     0x15D4FE4,  // models/ef_frostbite_Amode.mdl
     0x15D5004,  // models/ef_frostbite_skill.mdl
     0x15D5048,  // models/ef_frostbite_shield02.mdl
     0x15D506C,  // models/ef_frostbite_shield.mdl
     0x15D50AC,  // models/ef_frostbite_shoot_c.mdl
     0x15D50CC,  // models/ef_frostbite_shoot_c02.mdl
-    // sounds
     0x15D5110,  // weapons/frostbite_idle.wav
     0x15D512C,  // weapons/frostbite-1.wav
     0x15D5144,  // weapons/frostbite-2.wav
@@ -48,97 +44,96 @@ static const DWORD kAssetRVAs[] = {
     0x15D51D0,  // weapons/frostbite_fx_loop.wav
     0x15D51F0,  // weapons/frostbite_fx_loop_end.wav
     0x15D5214,  // weapons/frostbite_fx_exp.wav
-    // sprites
     0x15D4FC4,  // sprites/ef_frostbite_charge.spr
     0x15D5024,  // sprites/ef_frostbite_debuff_exp.spr
     0x15D508C,  // sprites/ef_frostbite_laser.spr
     0x15D50F0,  // sprites/frostbite_attack.spr
-    // event
     0x15D4FB0,  // events/frostbite.sc
 };
-static const int kAssetCount = sizeof(kAssetRVAs) / sizeof(kAssetRVAs[0]);
+static const int kAssetCount = (int)(sizeof(kAssetRVAs) / sizeof(kAssetRVAs[0]));
 
 // ---------------------------------------------------------------------------
-// Engine function typedefs (from engfuncs_t indices, standard HLSDK layout)
+// Engine precache typedefs (standard HLSDK engfuncs indices)
 // ---------------------------------------------------------------------------
-typedef int  (__cdecl *pfnPrecacheModel_t)(const char*);
-typedef int  (__cdecl *pfnPrecacheSound_t)(const char*);
-typedef int  (__cdecl *pfnPrecacheGeneric_t)(const char*);
+typedef int (__cdecl *pfnPrecacheModel_t)  (const char*);
+typedef int (__cdecl *pfnPrecacheSound_t)  (const char*);
+typedef int (__cdecl *pfnPrecacheGeneric_t)(const char*);
 
-// engfuncs indices (standard HLSDK enginefuncs_s):
-//  0  = pfnPrecacheModel
-//  1  = pfnPrecacheSound
-//  24 = pfnPrecacheGeneric  (sprites, events)
 static pfnPrecacheModel_t   g_PrecacheModel   = nullptr;
 static pfnPrecacheSound_t   g_PrecacheSound   = nullptr;
 static pfnPrecacheGeneric_t g_PrecacheGeneric = nullptr;
-
-// Base address of mp.dll — set once at init
-static uintptr_t g_mpBase = 0;
+static uintptr_t            g_mpBase          = 0;
 
 // ---------------------------------------------------------------------------
-// Our Precache replacement — called as __thiscall (ecx = this, ignored)
-// No C++ objects here so __try is safe if needed, but we don't need it.
+// Our Precache replacement.
+// Called as __stdcall with 2 args (8 bytes) — must RETN 8.
+// We use __cdecl + manual RET to keep it simple; the JMP trampoline will
+// land here and we emit RETN 8 at the end via naked asm.
+//
+// Actually: use __declspec(naked) to control the stack frame exactly.
 // ---------------------------------------------------------------------------
 
-static void __fastcall FrostbitePrecache(void* /*thisptr*/, void* /*edx_unused*/)
+static void __declspec(naked) FrostbitePrecache()
 {
-    Log("[FB-Precache] FrostbitePrecache called\n");
-
-    if (!g_mpBase) {
-        Log("[FB-Precache] ERROR: g_mpBase not set\n");
-        return;
+    __asm {
+        push    ebp
+        mov     ebp, esp
+        push    ebx
+        push    esi
+        push    edi
     }
+
+    // Do the actual precache work
+    Log("[FB-Precache] FrostbitePrecache called — precaching %d assets\n", kAssetCount);
 
     for (int i = 0; i < kAssetCount; ++i) {
         const char* path = reinterpret_cast<const char*>(g_mpBase + kAssetRVAs[i]);
         Log("[FB-Precache]   [%2d] %s\n", i, path);
 
-        // Route to correct precache function based on prefix
         if (strncmp(path, "models/", 7) == 0) {
             if (g_PrecacheModel) g_PrecacheModel(path);
-        } else if (strncmp(path, "weapons/", 8) == 0 ||
-                   strncmp(path, "sound/",   6) == 0) {
+        } else if (strncmp(path, "weapons/", 8) == 0) {
             if (g_PrecacheSound) g_PrecacheSound(path);
         } else {
-            // sprites/, events/ -> PrecacheGeneric
             if (g_PrecacheGeneric) g_PrecacheGeneric(path);
         }
     }
 
     Log("[FB-Precache] done\n");
+
+    __asm {
+        pop     edi
+        pop     esi
+        pop     ebx
+        pop     ebp
+        ret     8       // stdcall: pop 2 args (8 bytes) from caller's stack
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Plain helpers — __try allowed (no C++ objects)
+// Plain helpers — may use __try (no C++ objects)
 // ---------------------------------------------------------------------------
 
-static bool SafeWritePtr(uintptr_t addr, uintptr_t newVal, uintptr_t& oldVal)
+static bool SafeWriteBytes(uintptr_t addr, const uint8_t* bytes, size_t len)
 {
     DWORD old = 0;
-    if (!VirtualProtect(reinterpret_cast<void*>(addr), 4, PAGE_EXECUTE_READWRITE, &old))
-        return false;
-    __try {
-        oldVal = *reinterpret_cast<uintptr_t*>(addr);
-        *reinterpret_cast<uintptr_t*>(addr) = newVal;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        VirtualProtect(reinterpret_cast<void*>(addr), 4, old, &old);
+    if (!VirtualProtect(reinterpret_cast<void*>(addr), len, PAGE_EXECUTE_READWRITE, &old))
+    {
+        Log("[FB] VirtualProtect failed @ 0x%08zX err=%u\n", addr, GetLastError());
         return false;
     }
-    VirtualProtect(reinterpret_cast<void*>(addr), 4, old, &old);
+    __try {
+        memcpy(reinterpret_cast<void*>(addr), bytes, len);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        VirtualProtect(reinterpret_cast<void*>(addr), len, old, &old);
+        return false;
+    }
+    VirtualProtect(reinterpret_cast<void*>(addr), len, old, &old);
     return true;
 }
 
-static bool ReadU32(uintptr_t addr, uint32_t& out)
-{
-    __try {
-        out = *reinterpret_cast<uint32_t*>(addr);
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
-}
-
 // ---------------------------------------------------------------------------
-// FrostbiteFix_Init — no C++ objects, __try is fine
+// FrostbiteFix_Init
 // ---------------------------------------------------------------------------
 
 bool FrostbiteFix_Init(HMODULE hMp)
@@ -152,33 +147,44 @@ bool FrostbiteFix_Init(HMODULE hMp)
 
     g_mpBase = reinterpret_cast<uintptr_t>(hMp);
 
-    // Grab precache functions from engfuncs (indices 0, 1, 24)
+    // Grab precache fns from engfuncs (indices 0=PrecacheModel, 1=PrecacheSound, 24=PrecacheGeneric)
     auto** ef = reinterpret_cast<void**>(&g_engfuncs);
     g_PrecacheModel   = reinterpret_cast<pfnPrecacheModel_t>(ef[0]);
     g_PrecacheSound   = reinterpret_cast<pfnPrecacheSound_t>(ef[1]);
     g_PrecacheGeneric = reinterpret_cast<pfnPrecacheGeneric_t>(ef[24]);
 
-    Log("[FB] pfnPrecacheModel   [0] = 0x%08zX\n", reinterpret_cast<uintptr_t>(g_PrecacheModel));
-    Log("[FB] pfnPrecacheSound   [1] = 0x%08zX\n", reinterpret_cast<uintptr_t>(g_PrecacheSound));
-    Log("[FB] pfnPrecacheGeneric[24] = 0x%08zX\n", reinterpret_cast<uintptr_t>(g_PrecacheGeneric));
+    Log("[FB] pfnPrecacheModel   = 0x%08zX\n", reinterpret_cast<uintptr_t>(g_PrecacheModel));
+    Log("[FB] pfnPrecacheSound   = 0x%08zX\n", reinterpret_cast<uintptr_t>(g_PrecacheSound));
+    Log("[FB] pfnPrecacheGeneric = 0x%08zX\n", reinterpret_cast<uintptr_t>(g_PrecacheGeneric));
 
-    // Patch vtable slot 2 (Precache) of CFrostbite
-    // vtable is at mp.dll + kVtable_CFrostbite
-    // slot 2 is at vtable + 2*4 = vtable + 8
-    uintptr_t vtableAddr  = g_mpBase + kVtable_CFrostbite;
-    uintptr_t slotAddr    = vtableAddr + kSlot_Precache * sizeof(uintptr_t);
-    uintptr_t hookAddr    = reinterpret_cast<uintptr_t>(&FrostbitePrecache);
-    uintptr_t oldVal      = 0;
+    // Overwrite the Precache stub at mp.dll+0x5897F0 with a JMP to FrostbitePrecache.
+    // The stub is: C2 08 00 CC CC CC CC CC CC CC CC CC CC CC CC CC (16 bytes)
+    // We write: PUSH hookAddr (5 bytes) + RET (1 byte) = absolute indirect JMP.
+    // This fits in 6 bytes, well within the 16 byte stub.
+    uintptr_t stubAddr = g_mpBase + kRVA_PrecacheStub;
+    uintptr_t hookAddr = reinterpret_cast<uintptr_t>(&FrostbitePrecache);
 
-    uint32_t currentSlot  = 0;
-    ReadU32(slotAddr, currentSlot);
-    Log("[FB] CFrostbite vtable @ 0x%08zX\n", vtableAddr);
-    Log("[FB] Slot[2] (Precache) @ 0x%08zX  current=0x%08X\n", slotAddr, currentSlot);
+    // Verify stub still looks like we expect
+    uint8_t existing[3] = {};
+    __try {
+        memcpy(existing, reinterpret_cast<void*>(stubAddr), 3);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("[FB] Cannot read stub at 0x%08zX\n", stubAddr);
+        return false;
+    }
+    Log("[FB] Stub @ 0x%08zX: %02X %02X %02X\n", stubAddr, existing[0], existing[1], existing[2]);
 
-    if (SafeWritePtr(slotAddr, hookAddr, oldVal)) {
-        Log("[FB] Patched Precache slot: 0x%08zX -> 0x%08zX\n", oldVal, hookAddr);
+    // Build PUSH imm32 + RETN trampoline (6 bytes)
+    uint8_t trampoline[6];
+    trampoline[0] = 0x68;  // PUSH imm32
+    memcpy(&trampoline[1], &hookAddr, 4);
+    trampoline[5] = 0xC3;  // RETN (near return = jump to pushed address)
+
+    if (SafeWriteBytes(stubAddr, trampoline, sizeof(trampoline))) {
+        Log("[FB] Patched stub @ 0x%08zX -> JMP 0x%08zX (FrostbitePrecache)\n",
+            stubAddr, hookAddr);
     } else {
-        Log("[FB] FAILED to patch Precache slot!\n");
+        Log("[FB] FAILED to patch stub!\n");
         return false;
     }
 
