@@ -18,9 +18,11 @@ set_target_properties(frostbite_fix PROPERTIES
 
 target_compile_options(frostbite_fix PRIVATE
     /W3
-    /EHa    # Enable SEH (/EHa needed for __try/__except with C++ exceptions)
-    /GS-    # Disable security checks (smaller, no CRT dependency for these)
+    /EHa
+    /GS-
 )
+
+target_compile_definitions(frostbite_fix PRIVATE _CRT_SECURE_NO_WARNINGS)
 
 target_link_libraries(frostbite_fix PRIVATE psapi)
 

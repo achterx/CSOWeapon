@@ -1,4 +1,5 @@
 // givefnptrs.cpp — CSNZ frostbite fix, v7
+#define _CRT_SECURE_NO_WARNINGS
 // Fixes:
 //  1. Correct vtable detection (was finding entity-registry struct, not vtable)
 //  2. Log all engfuncs candidates with their index contents for manual validation
@@ -254,6 +255,24 @@ static bool ValidateEngfuncs(enginefuncs_t* ef, uintptr_t hwBase, uintptr_t hwEn
     return (setOriginPtr >= hwBase && setOriginPtr < hwEnd);
 }
 
+// ─── g_globals scan — plain function, no C++ objects, so __try is allowed ───
+
+static globalvars_t* ScanForGlobals(const uint8_t* mpData, size_t mpSize) {
+    for (size_t off = 0; off + 4 <= mpSize; off += 4) {
+        uint32_t ptrVal = 0;
+        if (!SafeRead32(mpData + off, ptrVal)) continue;
+        if (ptrVal < 0x10000 || ptrVal > 0x7FFFFFFF) continue;
+        __try {
+            const globalvars_t* g = reinterpret_cast<const globalvars_t*>((uintptr_t)ptrVal);
+            if (g->maxClients >= 1 && g->maxClients <= 64 &&
+                g->time >= 0.0f && g->frametime >= 0.0f && g->frametime < 1.0f) {
+                return const_cast<globalvars_t*>(g);
+            }
+        } __except(EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    return nullptr;
+}
+
 // ─── Main init ──────────────────────────────────────────────────────────────
 
 bool GiveFnptrs_Init(HMODULE hMp) {
@@ -330,28 +349,22 @@ bool GiveFnptrs_Init(HMODULE hMp) {
     Log("[GiveFnptrs] pfnSetOrigin (index 20) = 0x%08X\n", ptrs[20]);
     Log("[GiveFnptrs] engfuncs SUCCESS\n");
 
-    // ── Find g_globals ──────────────────────────────────────────────────
-    // g_globals is a globalvars_t* — search mp.dll .data for a ptr where
-    // time >= 0 and frametime >= 0 and maxClients in [1..64]
+    // g_globals found by ScanForGlobals (plain C helper, no C++ objects, can use __try)
     Log("[GiveFnptrs] Scanning for g_globals...\n");
-    for (size_t off = 0; off + sizeof(void*) <= mpSize; off += 4) {
-        uint32_t ptrVal = 0;
-        if (!SafeRead32(mpData + off, ptrVal)) continue;
-        if (ptrVal < 0x10000 || ptrVal > 0x7FFFFFFF) continue;
-        __try {
-            auto* g = reinterpret_cast<globalvars_t*>(ptrVal);
-            if (g->maxClients >= 1 && g->maxClients <= 64 &&
-                g->time >= 0.0f && g->frametime >= 0.0f && g->frametime < 1.0f) {
-                Log("[GiveFnptrs] g_globals = 0x%08X  (time=%.3f  maxClients=%d)\n",
-                    ptrVal, g->time, g->maxClients);
-                g_pGlobals = g;
-                break;
-            }
-        } __except(EXCEPTION_EXECUTE_HANDLER) {}
-    }
+    g_pGlobals = ScanForGlobals(mpData, mpSize);
     if (!g_pGlobals) {
         Log("[GiveFnptrs] WARNING: g_globals not found, continuing anyway\n");
+    } else {
+        Log("[GiveFnptrs] g_globals = 0x%08X  (time=%.3f  maxClients=%d)\n",
+            (uintptr_t)g_pGlobals, g_pGlobals->time, g_pGlobals->maxClients);
     }
+
+    return true;
+}
+
+uintptr_t FindWeaponFrostbiteVtable(HMODULE hMp) {
+    return FindFrostbiteVtable(hMp);
+}
 
     return true;
 }

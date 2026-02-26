@@ -10,6 +10,7 @@
 
 #include <windows.h>
 #include <cstdint>
+#include <vector>
 #include <psapi.h>
 #include "givefnptrs.h"
 #include "logger.h"
