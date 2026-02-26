@@ -111,6 +111,7 @@ static inline T& Field(void* base, int byteOffset)
 
 #define FB_EVENT_NORMAL      1
 #define FB_EVENT_CHARGED     7
+#define FB_THINK_INTERVAL    1.03f
 
 // Confirmed vtable slot indices (from IDA dump, CFrostbite vtable)
 #define SLOT_WEAPONIDLE      165
@@ -458,7 +459,6 @@ static void __fastcall Hook_PropThink(void* prop, void* /*edx*/)
     // Schedule next think
     PROP_NEXT_THINK(prop) = t + FB_THINK_INTERVAL;
 }
-#define FB_THINK_INTERVAL 1.03f
 
 // ---------------------------------------------------------------------------
 // Memory helpers
