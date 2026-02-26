@@ -111,31 +111,34 @@ namespace FBEvent
     constexpr int FEV_FLAG = 32;       // flags passed to PLAYBACK_EVENT_FULL
 }
 
-// --- Vtable slot numbers in CFrostbite's vtable (0x115D4F00 client) ---
-// Slots are 4-byte pointers. Slot 0 = vtable+0 = destructor.
-// We patch these slots in the SERVER mp.dll vtable.
-// Server addresses must be resolved at runtime via pattern scan.
+// --- Vtable slot numbers in CFrostbite's vtable ---
+// Slots are 4-byte pointers. Slot 0 = vtable[0] = first entry.
+// These are relative to the CFrostbite vtable pointer itself (0x115D4C80 in client IDB).
+// The vtable at 0x115D4F00 is CSimpleWpn<CFrostbite> wrapper — do NOT use that one.
+//
+// From IDA, CFrostbite vtable (0x115D4C80):
+//   [0x00] slot 0  — destructor
+//   [0x04] slot 1  — Spawn
+//   [0x08] slot 2  — Precache
+//   [0x0C] slot 3  — (base)
+//   [0x10] slot 4  — (base)
+//   [0x14] slot 5  — WeaponIdle   sub_10B30C80
+//   [0x18] slot 6  — PrimaryAttack sub_10B30E90
+//   [0x1C] slot 7  — SecondaryAttack sub_10B30F60
+//   [0x20] slot 8  — AddToPlayer  sub_10B30FE0
+//   [0x24] slot 9  — Holster      sub_10B31040
+//   [0x28] slot 10 — TakeDamage   sub_10B31060
+//   [0x2C] slot 11 — (base)
+//   [0x30] slot 12 — Think        sub_10B312C0
 namespace FBSlots
 {
-    // Unique-to-Frostbite slots (diverge from CSimpleWpn shared stubs):
-    constexpr int Slot_WeaponIdle      = 0x14 / 4;  // = slot 5
-    constexpr int Slot_PrimaryAttack   = 0x18 / 4;  // = slot 6  (sub_10B30E90)
-    constexpr int Slot_SecondaryAttack = 0x1C / 4;  // = slot 7  (sub_10B30F60)
-    constexpr int Slot_AddToPlayer     = 0x20 / 4;  // = slot 8  (sub_10B30FE0)
-    constexpr int Slot_Holster         = 0x24 / 4;  // = slot 9  (sub_10B31040)
-    constexpr int Slot_TakeDamage      = 0x28 / 4;  // = slot 10 (sub_10B31060)
-    constexpr int Slot_Think           = 0x30 / 4;  // = slot 12 (sub_10B312C0)
-
-    // From vtable at 0x115D4F00:
-    // +0x14 sub_10B30C80  WeaponIdle
-    // +0x18 sub_10B31100  PrimaryAttack (or linked to Think)
-    // +0x1C sub_10B30E90  PrimaryAttack fire
-    // +0x20 sub_10B30F60  SecondaryAttack
-    // +0x24 sub_10B30FE0  AddToPlayer
-    // +0x28 sub_10B31040  Holster / reset
-    // +0x2C sub_10B31060  TakeDamage / hit callback
-    // +0x30 sub_10B312C0  Think (prop)
-    // Adjust if server vtable has different base class depth!
+    constexpr int Slot_WeaponIdle      = 0x14 / 4;  // slot 5
+    constexpr int Slot_PrimaryAttack   = 0x18 / 4;  // slot 6  — sub_10B30E90
+    constexpr int Slot_SecondaryAttack = 0x1C / 4;  // slot 7  — sub_10B30F60
+    constexpr int Slot_AddToPlayer     = 0x20 / 4;  // slot 8  — sub_10B30FE0
+    constexpr int Slot_Holster         = 0x24 / 4;  // slot 9  — sub_10B31040
+    constexpr int Slot_TakeDamage      = 0x28 / 4;  // slot 10 — sub_10B31060
+    constexpr int Slot_Think           = 0x30 / 4;  // slot 12 — sub_10B312C0
 }
 
 // --- Recoil values applied on fire (player offsets) ---

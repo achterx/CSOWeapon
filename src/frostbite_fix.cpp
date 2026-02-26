@@ -341,15 +341,11 @@ static int __fastcall Hook_PrimaryAttack(void* ecx, void* /*edx*/)
     if (setAnim) setAnim(player, FBAnim::PlayerFire);
 
     // --- 5. Playback event (muzzle flash, sound) ---
-    // pfnPrecacheEvent index is stored at this+eventIndex (unknown offset — use 0 for now)
-    // In sub_10B37470: PLAYBACK_EVENT_FULL(32, pPlayer, eventIdx, 0, origin, angles, 0,0, eventParam, 0, 0, 0)
-    // eventParam = charged ? 7 : 1
-    // We call it via g_engfuncs->pfnPlaybackEvent
     entvars_t* playerPev = GetPev(player);
     if (playerPev && g_engfuncs->pfnPlaybackEvent) {
-        // Event index 0 = placeholder; server-side playback event needs precached index
-        // For now fire the event with the correct iparam1 so client knows charge state
-        PLAYBACK_EVENT_FULL(FBEvent::FEV_FLAG, player, 0, 0.f,
+        // pInvoker must be edict_t*. edict is 12 bytes before pev in GoldSrc layout.
+        void* pInvokerEdict = reinterpret_cast<uint8_t*>(playerPev) - 12;
+        PLAYBACK_EVENT_FULL(FBEvent::FEV_FLAG, pInvokerEdict, 0, 0.f,
             playerPev->origin(), playerPev->angles(),
             0.f, 0.f,
             charged ? FBEvent::Charged : FBEvent::Normal,

@@ -32,7 +32,6 @@ target_compile_definitions(frostbite_fix PRIVATE
     _USRDLL
     _CRT_SECURE_NO_WARNINGS
     NOMINMAX
-    WIN32_LEAN_AND_MEAN
 )
 
 if(MSVC)

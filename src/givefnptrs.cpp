@@ -28,8 +28,8 @@ bool GiveFnptrs_Init(HMODULE hMpDll)
         return false;
     }
 
-    // Call it — fills s_engfuncs and gives us the globals ptr
-    pfn(&s_engfuncs, s_globals_ptr);
+    // Call it — fills s_engfuncs in place, and writes the engine's globalvars_t* into s_globals_ptr
+    pfn(&s_engfuncs, &s_globals_ptr);
 
     g_engfuncs = &s_engfuncs;
     g_globals  = s_globals_ptr;

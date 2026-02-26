@@ -156,7 +156,7 @@ extern enginefuncs_t* g_engfuncs;
 extern globalvars_t*  g_globals;
 
 // typedef for the export
-typedef void (*GiveFnptrsToDll_t)(enginefuncs_t* pengfuncsFromEngine, globalvars_t* pGlobals);
+typedef void (*GiveFnptrsToDll_t)(enginefuncs_t* pengfuncsFromEngine, globalvars_t** pGlobals);
 
 // Call once after mp.dll is loaded.
 // Returns true on success.
