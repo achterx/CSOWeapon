@@ -1,17 +1,13 @@
-// frostbite_fix.cpp  v15
+// frostbite_fix.cpp  v16
 //
-// Same dual-vtable diagnostic as v14, but with FIXED globals resolution.
-// v14 showed t=0.00 always because GiveFnptrs_Init was grabbing the wrong
-// globals pointer via heuristic scan. v15 uses GiveFnptrsToDll disassembly
-// to find the real gpGlobals, and refreshes it on every hook call.
+// Key findings from v14:
+//   - CSimpleWpn<CFrostbite> vtable (vtbl1) is the active one ✓
+//   - Slot numbers 165-194 all correct ✓
+//   - t=0.00 always — gpGlobals wrong (fixed in givefnptrs v10)
+//   - SecondaryAttack fires on PROP object (player=null), not weapon
+//   - AddToPlayer receives player=0x255 (=597, weapon ID) — wrong arg
 //
-// From IDA (client mp.dll, imagebase 0x10000000):
-//   const CFrostbite::vftable           @ 0x115D4C80  RVA 0x015D4C80
-//   const CSimpleWpn<CFrostbite>::vftable @ 0x115D48CC  RVA 0x015D48CC
-//
-// v14 confirmed: CSimpleWpn<CFrostbite> vtable (vtbl1) is the active one.
-// Slot map confirmed correct from IDA dump (165-194 all <<<FB).
-//
+// v16: fix globals, add player-validity check before acting on hooks
 // v14: patch slots 165-194 in BOTH vtables with call-throughs,
 // log which vtable fires first.
 //
