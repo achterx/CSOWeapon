@@ -2,16 +2,12 @@
 #include <windows.h>
 #include <cstdint>
 
-// Minimal HLSDK types needed
-struct enginefuncs_s {
-    // Standard HLSDK enginefuncs_t — 218 function pointers
-    // We only need pfnSetOrigin (index 20) and pfnDispatchSpawn is in gamedll, not here.
-    // Declare as raw array of void* for simplicity; we access by index.
+// enginefuncs_t as a flat array of 218 void* — we access by index
+struct enginefuncs_t {
     void* funcs[218];
 };
-typedef struct enginefuncs_s enginefuncs_t;
 
-struct globalvars_s {
+struct globalvars_t {
     float        time;
     float        frametime;
     float        force_retouch;
@@ -44,10 +40,8 @@ struct globalvars_s {
     void*        pSaveData;
     float        vecLandmarkOffset[3];
 };
-typedef struct globalvars_s globalvars_t;
 
 extern enginefuncs_t  g_engfuncs;
 extern globalvars_t*  g_pGlobals;
 
-bool      GiveFnptrs_Init(HMODULE hMp);
-uintptr_t FindWeaponFrostbiteVtable(HMODULE hMp);
+bool GiveFnptrs_Init(HMODULE hMp);
