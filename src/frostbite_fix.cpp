@@ -63,6 +63,7 @@ static pfnPrecacheModel_t   g_PrecacheModel   = nullptr;
 static pfnPrecacheSound_t   g_PrecacheSound   = nullptr;
 static pfnPrecacheGeneric_t g_PrecacheGeneric = nullptr;
 static uintptr_t            g_mpBase          = 0;
+static bool                 g_stubPatched     = false;
 
 // ---------------------------------------------------------------------------
 // Our Precache replacement.
@@ -153,6 +154,16 @@ bool FrostbiteFix_Init(HMODULE hMp)
     g_PrecacheSound   = reinterpret_cast<pfnPrecacheSound_t>(ef[1]);
     g_PrecacheGeneric = reinterpret_cast<pfnPrecacheGeneric_t>(ef[24]);
 
+    // Sanity check: all must be non-null and 4-byte aligned
+    uintptr_t pm  = reinterpret_cast<uintptr_t>(g_PrecacheModel);
+    uintptr_t ps  = reinterpret_cast<uintptr_t>(g_PrecacheSound);
+    uintptr_t pg  = reinterpret_cast<uintptr_t>(g_PrecacheGeneric);
+    if (!pm || (pm & 3) || !ps || (ps & 3) || !pg || (pg & 3)) {
+        Log("[FB] FATAL: engfuncs pointers look invalid (unaligned or null) — aborting\n");
+        Log("[FB]   PrecacheModel=0x%08zX PrecacheSound=0x%08zX PrecacheGeneric=0x%08zX\n", pm, ps, pg);
+        return false;
+    }
+
     Log("[FB] pfnPrecacheModel   = 0x%08zX\n", reinterpret_cast<uintptr_t>(g_PrecacheModel));
     Log("[FB] pfnPrecacheSound   = 0x%08zX\n", reinterpret_cast<uintptr_t>(g_PrecacheSound));
     Log("[FB] pfnPrecacheGeneric = 0x%08zX\n", reinterpret_cast<uintptr_t>(g_PrecacheGeneric));
@@ -164,7 +175,8 @@ bool FrostbiteFix_Init(HMODULE hMp)
     uintptr_t stubAddr = g_mpBase + kRVA_PrecacheStub;
     uintptr_t hookAddr = reinterpret_cast<uintptr_t>(&FrostbitePrecache);
 
-    // Verify stub still looks like we expect
+    // Verify stub still looks like we expect (C2 08 00 = RETN 8)
+    // If it's already been patched (starts with 0x68 = PUSH), skip.
     uint8_t existing[3] = {};
     __try {
         memcpy(existing, reinterpret_cast<void*>(stubAddr), 3);
@@ -174,6 +186,16 @@ bool FrostbiteFix_Init(HMODULE hMp)
     }
     Log("[FB] Stub @ 0x%08zX: %02X %02X %02X\n", stubAddr, existing[0], existing[1], existing[2]);
 
+    if (g_stubPatched || existing[0] == 0x68 || existing[0] == 0xE9) {
+        Log("[FB] Stub already patched — skipping\n");
+        return true;
+    }
+
+    if (existing[0] != 0xC2) {
+        Log("[FB] Stub has unexpected bytes — RVA mismatch? Aborting patch.\n");
+        return false;
+    }
+
     // Build PUSH imm32 + RETN trampoline (6 bytes)
     uint8_t trampoline[6];
     trampoline[0] = 0x68;  // PUSH imm32
@@ -181,6 +203,7 @@ bool FrostbiteFix_Init(HMODULE hMp)
     trampoline[5] = 0xC3;  // RETN (near return = jump to pushed address)
 
     if (SafeWriteBytes(stubAddr, trampoline, sizeof(trampoline))) {
+        g_stubPatched = true;
         Log("[FB] Patched stub @ 0x%08zX -> JMP 0x%08zX (FrostbitePrecache)\n",
             stubAddr, hookAddr);
     } else {

@@ -57,10 +57,14 @@ static bool ValidateEngfuncs(const uint8_t* mpData, size_t offset,
 {
     auto* ptrs = reinterpret_cast<const uint32_t*>(mpData + offset);
     int ok = 0;
-    for (int i = 0; i < 5; ++i)
-        if (ptrs[i] >= (uint32_t)hwBase && ptrs[i] < (uint32_t)hwEnd) ++ok;
-    if (ok < 4) return false;
-    return ptrs[20] >= (uint32_t)hwBase && ptrs[20] < (uint32_t)hwEnd;
+    for (int i = 0; i < 5; ++i) {
+        uint32_t v = ptrs[i];
+        // Must be in hw.dll range AND 4-byte aligned (all real fn ptrs are)
+        if (v >= (uint32_t)hwBase && v < (uint32_t)hwEnd && (v & 3) == 0) ++ok;
+    }
+    if (ok < 5) return false;  // All 5 of [0..4] must pass
+    uint32_t v20 = ptrs[20];
+    return v20 >= (uint32_t)hwBase && v20 < (uint32_t)hwEnd && (v20 & 3) == 0;
 }
 
 // ---------------------------------------------------------------------------
