@@ -1,23 +1,26 @@
 #pragma once
 #include <cstdint>
 
-// mp.dll RVAs (imagebase 0x10000000, confirmed from IDA)
-static const uintptr_t RVA_weapon_janus1       = 0x0E96640; // factory entry point we hook
-static const uintptr_t RVA_weapon_m79          = 0x0F29F30; // M79 factory (reference impl)
-static const uintptr_t RVA_pGlobals            = 0x1E51BCC; // ptr to globalvars_t
-static const uintptr_t RVA_UTIL_WeaponTimeBase = 0x058A0B0;
-static const uintptr_t RVA_GetWeaponConfig     = 0x0576870;
-static const uintptr_t RVA_BaseAddToPlayer     = 0x0576FB0;
-static const uintptr_t RVA_PrecacheModel       = 0x0000000; // from engfuncs — set at runtime
-static const uintptr_t RVA_PrecacheSound       = 0x0000001; // from engfuncs — set at runtime
+// mp.dll RVAs (imagebase 0x10000000, confirmed from IDA + logs)
+static const uintptr_t RVA_weapon_janus1 = 0x0E96640;
+static const uintptr_t RVA_weapon_m79    = 0x0F29F30;
+static const uintptr_t RVA_pGlobals      = 0x1E51BCC; // *(ptr) = globalvars_t, first float = time
+static const uintptr_t RVA_engfuncs      = 0x1E51878; // engfuncs table base
 
-// Janus-1 weapon ID
-static const int WEAPON_JANUS1 = 570; // from game data (adjust if needed)
+// Individual engine function pointers stored in mp.dll (read as void**)
+// Confirmed: engfuncs[0]=PrecacheModel engfuncs[1]=PrecacheSound
+static const uintptr_t RVA_pfnPrecacheModel = 0x1E51878; // engfuncs[0]
+static const uintptr_t RVA_pfnPrecacheSound = 0x1E5187C; // engfuncs[1]
+static const uintptr_t RVA_pfnSetModel      = 0x1E51884; // engfuncs[3]  (SET_MODEL)
+static const uintptr_t RVA_pfnPrecacheEvent = 0x1E51A78; // confirmed from M79 Precache IDA
 
-// Janus-1 assets (from IDA Precache dump)
-#define JANUS1_MODEL_V  "models/v_janus1.mdl"
-#define JANUS1_MODEL_P  "models/p_janus1.mdl"
-#define JANUS1_MODEL_W  "models/w_janus1.mdl"
-#define JANUS1_SOUND_FIRE  "weapons/janus1-1.wav"
-#define JANUS1_SOUND_RELOAD "weapons/janus1_reload.wav"
-#define JANUS1_EVENT    "events/janus1.sc"
+// CM79 vtable RVA
+static const uintptr_t RVA_CM79_vtable      = 0x159FA04;
+
+// Vtable slot indices (from IDA CSimpleWpn vtable dump)
+static const int VTBL_Deploy        = 102;
+static const int VTBL_PrimaryAttack = 167;
+static const int VTBL_WeaponIdle    = 165;
+static const int VTBL_Reload        = 166;
+static const int VTBL_AddToPlayer   = 175;
+static const int VTBL_Holster       = 191;
