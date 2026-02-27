@@ -1,33 +1,19 @@
 cmake_minimum_required(VERSION 3.15)
-project(frostbite_fix)
+project(csnz_weapons)
+set(CMAKE_CXX_STANDARD 17)
 
-set(CMAKE_GENERATOR_PLATFORM Win32)
-
-add_library(frostbite_fix SHARED
+add_library(csnz_weapons SHARED
     src/dllmain.cpp
-    src/frostbite_fix.cpp
-    src/givefnptrs.cpp
+    src/hooks.cpp
+    src/logger.cpp
+    src/weapons/janus1.cpp
 )
 
-target_include_directories(frostbite_fix PRIVATE src)
+target_include_directories(csnz_weapons PRIVATE src)
 
-set_target_properties(frostbite_fix PROPERTIES
-    CXX_STANDARD 17
-    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
-)
+set_target_properties(csnz_weapons PROPERTIES PREFIX "" OUTPUT_NAME "csnz_weapons")
 
-target_compile_options(frostbite_fix PRIVATE
-    /W3
-    /EHa
-    /GS-
-)
-
-target_compile_definitions(frostbite_fix PRIVATE _CRT_SECURE_NO_WARNINGS)
-
-target_link_libraries(frostbite_fix PRIVATE psapi)
-
-# Ensure 32-bit
 if(MSVC)
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /MACHINE:X86")
-    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} /MACHINE:X86")
+    target_compile_options(csnz_weapons PRIVATE /W3 /EHa)
+    target_link_options(csnz_weapons PRIVATE /MACHINE:X86)
 endif()

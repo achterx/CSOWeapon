@@ -1,28 +1,17 @@
-name: Build frostbite_fix v7
-
-on:
-  push:
-  workflow_dispatch:
-
+name: Build
+on: [push, pull_request]
 jobs:
   build:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Configure (x86)
-        run: |
-          cmake -B build -A Win32 -DCMAKE_BUILD_TYPE=Release
-
+      - name: Configure
+        run: cmake -B build -A Win32
       - name: Build
         run: cmake --build build --config Release
-
-      - name: Package
-        run: |
-          mkdir dist
-          copy build\Release\frostbite_fix.dll dist\frostbite_fix.dll
-
-      - uses: actions/upload-artifact@v4
+      - name: Upload
+        uses: actions/upload-artifact@v4
         with:
-          name: frostbite_fix_v7
-          path: dist\
+          name: csnz_weapons
+          path: build/Release/csnz_weapons.dll
+          retention-days: 30
