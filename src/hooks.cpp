@@ -77,12 +77,17 @@ bool WriteJmp5(uintptr_t from, uintptr_t to, uint8_t* outOrig)
 }
 
 // -------------------------------------------------------------------------
-// Resolve gpGlobals->time and engfuncs
+// Resolve gpGlobals and engfuncs
+// RVA_engfuncs = 0x1E51878  (confirmed from log: engfuncs @ mp+0x1E51878
+//                             pfnPrecacheModel=0x03125190 which is valid hw.dll)
 // -------------------------------------------------------------------------
+static const uintptr_t RVA_engfuncs = 0x1E51878;
+
 static bool ResolveGlobals(HMODULE hMp)
 {
     uintptr_t base = (uintptr_t)hMp;
 
+    // gpGlobals->time
     uint32_t pGlobals = 0;
     if (!SafeRead32(base + RVA_pGlobals, pGlobals) || !pGlobals)
     {
@@ -92,35 +97,21 @@ static bool ResolveGlobals(HMODULE hMp)
     g_pTime = reinterpret_cast<float*>((uintptr_t)pGlobals);
     Log("[hooks] gpGlobals @ 0x%08X  time=%.3f\n", pGlobals, *g_pTime);
 
-    HMODULE hHw = GetModuleHandleA("hw.dll");
-    if (!hHw) { Log("[hooks] hw.dll not found\n"); return false; }
-
-    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)hMp;
-    IMAGE_NT_HEADERS* nt  = (IMAGE_NT_HEADERS*)((uint8_t*)hMp + dos->e_lfanew);
-    uint8_t* mpData = (uint8_t*)base;
-    DWORD    mpSize = nt->OptionalHeader.SizeOfImage;
-
-    IMAGE_DOS_HEADER* hdos = (IMAGE_DOS_HEADER*)hHw;
-    IMAGE_NT_HEADERS* hnt  = (IMAGE_NT_HEADERS*)((uint8_t*)hHw + hdos->e_lfanew);
-    uintptr_t hwBase = (uintptr_t)hHw;
-    uintptr_t hwEnd  = hwBase + hnt->OptionalHeader.SizeOfImage;
-
-    size_t bestOff = 0; int bestRun = 0, curRun = 0; size_t runStart = 0;
-    for (size_t off = 0; off + 4 <= mpSize; off += 4)
-    {
-        uint32_t v = 0;
-        __try { v = *reinterpret_cast<uint32_t*>(mpData + off); }
-        __except(EXCEPTION_EXECUTE_HANDLER) { curRun = 0; continue; }
-        if (v >= hwBase && v < hwEnd) { if (!curRun) runStart = off; curRun++; }
-        else { if (curRun > bestRun) { bestRun = curRun; bestOff = runStart; } curRun = 0; }
-    }
-    if (bestRun < 20) { Log("[hooks] engfuncs not found (bestRun=%d)\n", bestRun); return false; }
-
+    // Engfuncs — fixed RVA confirmed from logs
     static enginefuncs_t ef;
-    memcpy(&ef, mpData + bestOff, sizeof(ef));
+    void* engfuncsPtr = reinterpret_cast<void*>(base + RVA_engfuncs);
+    __try { memcpy(&ef, engfuncsPtr, sizeof(ef)); }
+    __except(EXCEPTION_EXECUTE_HANDLER)
+    {
+        Log("[hooks] Failed to read engfuncs\n");
+        return false;
+    }
     g_engfuncs = &ef;
-    Log("[hooks] engfuncs @ mp+0x%zX  pfnPrecacheModel=0x%08X\n",
-        bestOff, (uint32_t)(uintptr_t)ef.pfnPrecacheModel);
+    Log("[hooks] engfuncs @ mp+0x%zX  pfnPrecacheModel=0x%08X  pfnPrecacheSound=0x%08X\n",
+        RVA_engfuncs,
+        (uint32_t)(uintptr_t)ef.pfnPrecacheModel,
+        (uint32_t)(uintptr_t)ef.pfnPrecacheSound);
+
     return true;
 }
 
