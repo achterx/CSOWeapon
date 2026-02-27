@@ -162,16 +162,19 @@ struct entvars_t
     edict_t*    euser4;        // +0x2A0
 };
 
-// edict_t layout (GoldSrc standard)
+// edict_t layout for CSNZ
+// IDA confirmed: pvPrivateData at offset +0x80
+// The full struct is larger than standard GoldSrc (extra fields between serial and pvPrivateData)
+// We define it as opaque with correct size padding so any pointer arithmetic is safe.
+// In practice we only ever pass edict_t* to engine functions — we never access fields directly.
 struct edict_t
 {
-    int         free;              // +0x00
-    int         serialnumber;      // +0x04
-    // link_t area (2 pointers)
-    void*       area_prev;         // +0x08
-    void*       area_next;         // +0x0C
-    void*       pvPrivateData;     // +0x10 — CBaseEntity* (the C++ object)
-    entvars_t   v;                 // +0x14 — inline entvars (VERY large)
+    int         free;               // +0x00
+    int         serialnumber;       // +0x04
+    uint8_t     _pad[0x78];         // +0x08  padding to reach pvPrivateData
+    void*       pvPrivateData;      // +0x80  CBaseEntity* (CSNZ confirmed by IDA)
+    // entvars_t* v follows (pev is a pointer, NOT inline in CSNZ)
+    entvars_t*  v;                  // +0x84
 };
 
 // -----------------------------------------------------------------------

@@ -38,30 +38,34 @@ struct ItemInfo
 #define WEAPON_NOCLIP  -1
 
 // -----------------------------------------------------------------------
-// edict helpers
-// From real GoldSrc: edict_t->pvPrivateData is at offset 0x10 (16 bytes)
-//   edict_t layout: free(4), serial(4), area_prev(4), area_next(4), pvPrivateData(4), entvars_t(...)
-// entvars_t->pContainingEntity is the last field before inline entvars, BUT in GoldSrc
-// entvars_t is stored INLINE in edict_t starting at offset 0x14.
-// pContainingEntity in entvars_t points back to the edict.
+// CSNZ edict helpers
+//
+// IDA CONFIRMED offsets (from disasm of weapon_janus1 factory):
+//   mov ecx, [esi+238h]       => edict* = *(pev + 0x238)
+//   cmp [ecx+80h], 0          => pvPrivateData at edict+0x80
+//
+// In CSNZ, pev is NOT inline inside edict_t; it's separately allocated.
+// The edict backpointer is stored at pev+0x238 (maps to entvars_t::gamestate
+// in the struct definition but is actually repurposed in CSNZ as edict ptr).
+// pvPrivateData (the C++ object) is at edict+0x80 (not standard GoldSrc 0x10).
 // -----------------------------------------------------------------------
-#define EDICT_PVPRIVATE_OFFSET  0x10   // pvPrivateData offset in edict_t
+#define CSNZ_PEV_TO_EDICT_OFFSET  0x238   // edict* ptr stored at pev+0x238
+#define CSNZ_PVPRIVATE_OFFSET     0x80    // pvPrivateData in edict_t at +0x80
 
 inline edict_t* PEV_TO_EDICT(entvars_t* pev)
 {
-    // pev->pContainingEntity: in the real entvars_t layout (as inline in edict_t at +0x14),
-    // the pContainingEntity field is NOT the first field of entvars_t.
-    // In GoldSrc: entvars_t is INLINE, pContainingEntity at entvars_t+0x208.
-    // BUT: the engine sets edict->v.pContainingEntity = edict before calling factory.
-    // So: (edict_t*)((char*)pev - 0x14) — because pev = &edict->v = edict + 0x14
-    // This is the standard GoldSrc trick: edict = container of pev
-    return reinterpret_cast<edict_t*>(reinterpret_cast<uint8_t*>(pev) - 0x14);
+    if (!pev) return nullptr;
+    // Read edict pointer stored at pev+0x238 (IDA confirmed)
+    return *reinterpret_cast<edict_t**>(
+        reinterpret_cast<uint8_t*>(pev) + CSNZ_PEV_TO_EDICT_OFFSET);
 }
 
 inline void* EDICT_PRIVATE(edict_t* e)
 {
     if (!e) return nullptr;
-    return *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(e) + EDICT_PVPRIVATE_OFFSET);
+    // pvPrivateData at edict+0x80 (IDA confirmed)
+    return *reinterpret_cast<void**>(
+        reinterpret_cast<uint8_t*>(e) + CSNZ_PVPRIVATE_OFFSET);
 }
 
 // -----------------------------------------------------------------------
