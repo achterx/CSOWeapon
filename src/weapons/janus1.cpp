@@ -158,11 +158,7 @@ void CJanus1::Holster(int skiplocal)
         return;
     }
 
-    // Fallback: clear player models manually
-    if (m_pPlayer && m_pPlayer->pev) {
-        m_pPlayer->pev->viewmodel  = 0;
-        m_pPlayer->pev->weaponmodel = 0;
-    }
+    // Fallback: nothing (M79 vtable should always be available)
 }
 
 void CJanus1::PrimaryAttack()

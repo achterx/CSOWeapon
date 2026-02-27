@@ -273,3 +273,19 @@ public:
     // Rather than guess, we store it locally and write it directly on init.
     unsigned short  m_usFireEvent;          // fire event handle (PRECACHE_EVENT result)
 };
+
+// -----------------------------------------------------------------------
+// CBasePlayer — minimal stub so weapon methods can take CBasePlayer* params.
+// The actual player object lives in game memory; we only store the pointer
+// and pass it through to M79 delegation calls. We never dereference fields
+// directly (that would require the full 6000-byte player layout).
+// -----------------------------------------------------------------------
+class CBasePlayer : public CBaseEntity
+{
+public:
+    // We don't define any fields or methods here — accessing player internals
+    // is done via M79 vtable delegation, which uses the game's own code.
+    // If you ever need a specific player field, add it here with the correct
+    // byte offset (from IDA) and use Field<T>(this, offset) to access it.
+    int m_rgAmmo[32];   // ammo array — needed by some weapon logic
+};
