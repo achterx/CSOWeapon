@@ -18,6 +18,8 @@
 static void** g_vtable      = nullptr;
 static bool   g_vtableReady = false;
 
+static void* g_origPrecache    = nullptr;
+static void* g_origSpawn       = nullptr;
 static void* g_origDeploy      = nullptr;
 static void* g_origWeaponIdle  = nullptr;
 static void* g_origAddToPlayer = nullptr;
@@ -28,6 +30,8 @@ static bool    g_origSaved    = false;
 typedef void(__cdecl* pfnOrigFactory_t)(int);
 
 // Correct slot numbers from IDA
+static const int SLOT_Spawn       = 3;
+static const int SLOT_Precache    = 4;
 static const int SLOT_AddToPlayer = 95;
 static const int SLOT_Deploy      = 102;
 static const int SLOT_WeaponIdle  = 142;
@@ -37,6 +41,21 @@ static const int VTABLE_SIZE      = 201;
 // -----------------------------------------------------------------------
 // Overrides - log and call original Janus1 implementations
 // -----------------------------------------------------------------------
+// Safe Precache - only calls real Precache during map load (time == 0)
+// If called at runtime (time > 0), silently returns -- avoids pfnPrecacheSound crash
+static int __fastcall J1_Precache(void* self, void* /*edx*/)
+{
+    float t = GetTime();
+    if (t > 0.0f)
+    {
+        Log("[janus1] Precache suppressed at t=%.1f\n", t);
+        return 1;
+    }
+    Log("[janus1] Precache (map load)\n");
+    typedef int(__thiscall* Fn)(void*);
+    return reinterpret_cast<Fn>(g_origPrecache)(self);
+}
+
 static int __fastcall J1_Deploy(void* self, void* /*edx*/)
 {
     Log("[janus1] Deploy\n");
@@ -87,6 +106,7 @@ static bool BuildVtableFromObject(void* obj)
     }
 
     // Save originals before patching
+    g_origPrecache    = origVtbl[SLOT_Precache];
     g_origDeploy      = origVtbl[SLOT_Deploy];
     g_origWeaponIdle  = origVtbl[SLOT_WeaponIdle];
     g_origAddToPlayer = origVtbl[SLOT_AddToPlayer];
@@ -98,6 +118,7 @@ static bool BuildVtableFromObject(void* obj)
         SLOT_AddToPlayer, g_origAddToPlayer,
         SLOT_Holster, g_origHolster);
 
+    g_vtable[SLOT_Precache]    = (void*)J1_Precache;
     g_vtable[SLOT_Deploy]      = (void*)J1_Deploy;
     g_vtable[SLOT_WeaponIdle]  = (void*)J1_WeaponIdle;
     g_vtable[SLOT_AddToPlayer] = (void*)J1_AddToPlayer;
@@ -150,7 +171,7 @@ void __cdecl Janus1_Factory(int edict)
         if (!BuildVtableFromObject(obj)) return;
 
     *reinterpret_cast<void**>(obj) = g_vtable;
-    Log("[janus1] Swapped on obj=%p\n", obj);
+    Log("[janus1] Swapped on obj=%p -- factory returning now\n", obj);
 }
 
 // -----------------------------------------------------------------------
@@ -159,6 +180,8 @@ void __cdecl Janus1_Factory(int edict)
 void Janus1_PostInit(uintptr_t mpBase)
 {
     Log("[janus1] PostInit\n");
+
+    // Nothing extra needed - J1_Precache uses GetTime() from hooks
     const uint8_t* sb = GetSavedBytes(RVA_weapon_janus1);
     if (sb) { memcpy(g_origBytes, sb, 5); g_origSaved = true; }
     else
