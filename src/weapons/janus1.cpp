@@ -1,10 +1,14 @@
 // janus1.cpp - Janus1 weapon
-// DO NOT override Precache (slot 4) or Spawn (slot 3).
-// These run at map-load time via the original Janus1 vtable -- they already
-// work. We only swap the vtable AFTER the factory runs (t=1.000), so any
-// slot that gets called immediately on spawn must delegate safely.
-// Slots 3 and 4 are NOT in our override list -- the original Janus1
-// implementations stay in place for those.
+// 
+// THE ONLY THING THIS DOES:
+// 1. Let original weapon_janus1 factory run completely (Spawn, Precache all happen normally)
+// 2. Read the vtable pointer off the live object AFTER construction
+// 3. Make a copy of that vtable
+// 4. Patch ONLY Deploy(102), WeaponIdle(165), AddToPlayer(175), Holster(189)
+// 5. Swap the object's vtable to our copy
+//
+// Spawn(3) and Precache(4) stay as original Janus1 code - they work fine already.
+// We copy from the live object so we never need a hardcoded vtable RVA.
 
 #include "janus1.h"
 #include "../hooks.h"
@@ -13,27 +17,21 @@
 #include <cstdint>
 #include <windows.h>
 
-static void** g_m79Vtable   = nullptr;
-static void** g_j1OrigVtable = nullptr; // original Janus1 vtable (kept for safe fallback)
+static void** g_m79Vtable = nullptr;
 static const uintptr_t RVA_CM79_vtable = 0x159FA04;
 
-static void* g_vtable[220] = {};
-static bool  g_vtableReady = false;
+// Our patched vtable - allocated once from the first live object
+static void** g_vtable    = nullptr;
+static int    g_vtableLen = 0;
+static bool   g_vtableReady = false;
 
 static uint8_t g_origBytes[5] = {};
 static bool    g_origSaved    = false;
 typedef void(__cdecl* pfnOrigFactory_t)(int);
 
 // -----------------------------------------------------------------------
-// ONLY override slots that are safe to call at runtime (not precache-phase)
-// Slot 102: Deploy   - safe, called when player equips weapon
-// Slot 165: WeaponIdle - safe, called every frame
-// Slot 175: AddToPlayer - safe, called when player picks up weapon
-// Slot 189: Holster  - safe, called when player switches weapon
-//
-// Slots 3 (Spawn) and 4 (Precache) are LEFT AS ORIGINAL Janus1 code.
+// ONLY these 4 slots - all safe to call at runtime, none do precaching
 // -----------------------------------------------------------------------
-
 static int __fastcall J1_Deploy(void* self, void* /*edx*/)
 {
     Log("[janus1] Deploy\n");
@@ -62,31 +60,49 @@ static void __fastcall J1_Holster(void* self, void* /*edx*/, int skiplocal)
 }
 
 // -----------------------------------------------------------------------
-// Build vtable: start from ORIGINAL JANUS1 vtable (not M79!)
-// This means all slots default to what Janus1 already does correctly.
-// We then patch only the 4 runtime-safe slots.
+// Build vtable from a LIVE object's vtable pointer
+// Called once on the first spawned object
 // -----------------------------------------------------------------------
-static bool BuildVtable(uintptr_t mpBase)
+static bool BuildVtableFromObject(void* obj)
 {
-    g_m79Vtable    = reinterpret_cast<void**>(mpBase + RVA_CM79_vtable);
-    g_j1OrigVtable = reinterpret_cast<void**>(mpBase + RVA_Janus1_vtable);
+    void** origVtbl = *reinterpret_cast<void***>(obj);
+    Log("[janus1] Live vtable @ %p slot[0]=%p slot[3]=%p slot[4]=%p\n",
+        (void*)origVtbl, origVtbl[0], origVtbl[3], origVtbl[4]);
 
-    // Copy Janus1's original vtable as base
-    __try { memcpy(g_vtable, g_j1OrigVtable, 220 * sizeof(void*)); }
-    __except(EXCEPTION_EXECUTE_HANDLER)
+    // Count slots by scanning for executable memory
+    int n = 0;
+    for (int i = 0; i < 512; i++)
     {
-        Log("[janus1] Failed to copy Janus1 vtable\n");
-        return false;
+        void* fn = origVtbl[i];
+        if (!fn) break;
+        MEMORY_BASIC_INFORMATION mbi = {};
+        if (!VirtualQuery(fn, &mbi, sizeof(mbi))) break;
+        DWORD exec = PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                     PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        if (!(mbi.Protect & exec)) break;
+        n++;
     }
+    if (n < 10) { Log("[janus1] Vtable too short (%d)\n", n); return false; }
+    Log("[janus1] Vtable has %d slots\n", n);
 
-    // Only patch the 4 runtime-safe slots
-    g_vtable[102] = (void*)J1_Deploy;
-    g_vtable[165] = (void*)J1_WeaponIdle;
-    g_vtable[175] = (void*)J1_AddToPlayer;
-    g_vtable[189] = (void*)J1_Holster;
+    // Allocate and copy
+    g_vtable = reinterpret_cast<void**>(
+        VirtualAlloc(nullptr, n * sizeof(void*),
+                     MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (!g_vtable) { Log("[janus1] VirtualAlloc failed\n"); return false; }
+
+    memcpy(g_vtable, origVtbl, n * sizeof(void*));
+    g_vtableLen = n;
+
+    // Patch ONLY the 4 runtime-safe slots
+    // Slots 3 (Spawn) and 4 (Precache) are deliberately left as original
+    if (102 < n) g_vtable[102] = (void*)J1_Deploy;
+    if (165 < n) g_vtable[165] = (void*)J1_WeaponIdle;
+    if (175 < n) g_vtable[175] = (void*)J1_AddToPlayer;
+    if (189 < n) g_vtable[189] = (void*)J1_Holster;
 
     g_vtableReady = true;
-    Log("[janus1] Vtable ready (base=Janus1orig, patched: Deploy[102] WeaponIdle[165] AddToPlayer[175] Holster[189])\n");
+    Log("[janus1] Vtable built (%d slots, patched Deploy[102] WeaponIdle[165] AddToPlayer[175] Holster[189])\n", n);
     return true;
 }
 
@@ -112,11 +128,10 @@ void __cdecl Janus1_Factory(int edict)
 {
     Log("[janus1] Factory edict=%d\n", edict);
 
-    // Call original - allocates object with Janus1's original vtable
+    // Run original factory - this allocates object, sets vtable, calls Spawn+Precache
     CallOrigJanus1(edict);
-    if (!g_vtableReady) return;
 
-    // Find the object
+    // Find the object via confirmed pointer chain
     void* obj = nullptr;
     __try
     {
@@ -130,12 +145,18 @@ void __cdecl Janus1_Factory(int edict)
         Log("[janus1] Exception finding obj\n");
         return;
     }
-
     if (!obj) { Log("[janus1] obj null\n"); return; }
 
-    // Swap to our vtable (Janus1-based, 4 slots patched)
+    // Build vtable from this live object on first call
+    if (!g_vtableReady)
+    {
+        if (!BuildVtableFromObject(obj))
+            return;
+    }
+
+    // Swap vtable
     *reinterpret_cast<void**>(obj) = g_vtable;
-    Log("[janus1] Vtable swapped on obj=%p\n", obj);
+    Log("[janus1] Swapped on obj=%p\n", obj);
 }
 
 // -----------------------------------------------------------------------
@@ -144,7 +165,8 @@ void __cdecl Janus1_Factory(int edict)
 void Janus1_PostInit(uintptr_t mpBase)
 {
     Log("[janus1] PostInit\n");
-    BuildVtable(mpBase);
+
+    g_m79Vtable = reinterpret_cast<void**>(mpBase + RVA_CM79_vtable);
 
     const uint8_t* sb = GetSavedBytes(RVA_weapon_janus1);
     if (sb) { memcpy(g_origBytes, sb, 5); g_origSaved = true; }
@@ -155,7 +177,7 @@ void Janus1_PostInit(uintptr_t mpBase)
         g_origSaved = true;
     }
 
-    Log("[janus1] PostInit done\n");
+    Log("[janus1] PostInit done. M79vtable=%p\n", (void*)g_m79Vtable);
 }
 
 // -----------------------------------------------------------------------
