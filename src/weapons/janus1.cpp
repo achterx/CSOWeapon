@@ -281,53 +281,32 @@ void __cdecl Janus1_Factory(entvars_t* pev)
     // Call original factory to properly allocate and construct the object
     CallOrigFactory(pev);
 
-    // Find the allocated object
-    // In GoldSrc: pev is actually the pointer to the inline entvars_t inside edict_t.
-    // edict_t layout: [free:4][serial:4][area_prev:4][area_next:4][pvPrivateData:4][entvars_t...]
-    // pvPrivateData is at edict+0x10. edict_t starts 0x14 bytes before pev? No —
-    // actually pev IS a pointer to entvars_t which is stored inline in edict_t at offset 0x14.
-    // So: edict = (uint8_t*)pev - 0x14, pvPrivateData at edict+0x10.
+    // IDA disasm of weapon_janus1 confirmed:
+    //   esi = pev  (arg_0)
+    //   ecx = *(pev + 0x238)        <- edict pointer
+    //   eax = ALLOC(ecx, 0x1F8)     <- allocated object (returned in eax)
+    //   [eax+8] = esi               <- obj->pev = pev  (pev stored at obj+8)
+    //   pvPrivateData stored at edict+0x80  (cmp [ecx+80h], 0 before alloc)
     //
-    // BUT: CSNZ may store things differently. Let's use the safe approach:
-    // edict_t* e = (edict_t*)((uint8_t*)pev - offsetof(edict_t, v))
-    // offsetof(edict_t, v) = 0x14 (from our struct definition above, after 5 x 4-byte fields)
-    //
-    // Actually safer: pev->pContainingEntity is at pev+0x208 (in the full entvars_t struct)
-    // and it points to the edict. Use that.
+    // So: edict = *(pev + 0x238),  obj = *(edict + 0x80)
 
     void* obj = nullptr;
     __try {
-        // Method 1: pev->pContainingEntity (at entvars_t offset 0x208) -> edict
-        // Then edict->pvPrivateData (at edict offset 0x10)
-        edict_t* edict = *reinterpret_cast<edict_t**>(
-            reinterpret_cast<uint8_t*>(pev) + 0x208); // pContainingEntity
-
+        void* edict = *reinterpret_cast<void**>(
+            reinterpret_cast<uint8_t*>(pev) + 0x238);
+        Log("[janus1] edict=%p\n", edict);
         if (edict) {
             obj = *reinterpret_cast<void**>(
-                reinterpret_cast<uint8_t*>(edict) + 0x10); // pvPrivateData
+                reinterpret_cast<uint8_t*>(edict) + 0x80);
         }
     }
     __except(EXCEPTION_EXECUTE_HANDLER) {
-        obj = nullptr;
+        Log("[janus1] Exception finding obj from pev=%p\n", pev);
+        return;
     }
 
     if (!obj) {
-        // Method 2: if pev is the inline entvars_t in edict_t at offset 0x14
-        // edict_t* = pev - 0x14, pvPrivateData at that - 0x10
-        __try {
-            uint8_t* possibleEdict = reinterpret_cast<uint8_t*>(pev) - 0x14;
-            void* candidate = *reinterpret_cast<void**>(possibleEdict + 0x10);
-            // Sanity: candidate should be readable and in a reasonable range
-            if (candidate && (uintptr_t)candidate > 0x10000000) {
-                obj = candidate;
-                Log("[janus1] Found obj via method2: %p\n", obj);
-            }
-        }
-        __except(EXCEPTION_EXECUTE_HANDLER) {}
-    }
-
-    if (!obj) {
-        Log("[janus1] Factory: could not find obj from pev=%p\n", pev);
+        Log("[janus1] obj null after factory\n");
         return;
     }
 
