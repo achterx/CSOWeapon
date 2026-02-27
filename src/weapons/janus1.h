@@ -1,12 +1,16 @@
 #pragma once
-#include "../hlsdk/cso_baseweapon.h"
+#include "../hlsdk/sdk.h"
+#include "../hlsdk/mp_offsets.h"
+#include <cstdint>
 
-#define WEAPON_JANUS1       570
-#define JANUS1_MAX_CLIP     1
-#define JANUS1_DEFAULT_GIVE 1
-#define JANUS1_WEIGHT       15
+// Object size matching CSNZ's CM79 subclass (IDA: pfnAllocEntPrivateData(v3, 0x1F0) = 496 bytes)
+// Note: M79 uses 0x1F0 = 496, weapon_janus1 uses 0x1F8 = 504
+static const int JANUS1_OBJ_SIZE = 504;
 
-enum janus1_e { JANUS1_IDLE=0, JANUS1_SHOOT=1, JANUS1_RELOAD=2, JANUS1_DRAW=3 };
+// Field offsets within the weapon object (from IDA analysis)
+// usFireEvent is stored as uint16 — used to hold PrecacheEvent handle
+static const int F_usFireEvent = 0x1E8;
+static const int F_iClip       = 0x154; // m_iClip
 
-void Janus1_PostInit(uintptr_t mpBase);
-void __cdecl Janus1_Factory(entvars_t* pev);
+void __cdecl Janus1_Factory(int edict);
+void         Janus1_PostInit(uintptr_t mpBase);
