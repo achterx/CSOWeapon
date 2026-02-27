@@ -117,7 +117,14 @@ static bool ResolveGlobals(HMODULE hMp)
     return true;
 }
 
-// -------------------------------------------------------------------------
+const uint8_t* GetSavedBytes(uintptr_t origRVA)
+{
+    for (int i = 0; i < g_hookCount; i++)
+        if (g_hooks[i].origRVA == origRVA && g_hooks[i].done)
+            return g_hooks[i].origBytes;
+    return nullptr;
+}
+
 bool Hooks_Install(HMODULE hMp)
 {
     g_mpBase = (uintptr_t)hMp;
@@ -130,7 +137,7 @@ bool Hooks_Install(HMODULE hMp)
     {
         HookEntry& h = g_hooks[i];
         uintptr_t target = g_mpBase + h.origRVA;
-        if (WriteJmp5(target, (uintptr_t)h.hookFn, nullptr))
+        if (WriteJmp5(target, (uintptr_t)h.hookFn, h.origBytes))
         {
             h.done = true; n++;
             Log("[hooks] %-20s patched 0x%08zX -> 0x%08zX\n",
