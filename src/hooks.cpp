@@ -1,4 +1,4 @@
-// hooks.cpp — weapon entry point hooking engine
+// hooks.cpp - weapon entry point hooking engine
 #include "hooks.h"
 #include "logger.h"
 #include "hlsdk/mp_offsets.h"

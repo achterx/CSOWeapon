@@ -1,4 +1,4 @@
-// janus1.cpp — CJanus1 grenade launcher (v24)
+// janus1.cpp - CJanus1 grenade launcher (v24)
 //
 // WHAT CHANGED FROM THE WORKING STUB:
 //   - Factory now actually swaps the vtable on the spawned object
@@ -6,12 +6,12 @@
 //       Spawn=3, Precache=4, Deploy=102, WeaponIdle=165,
 //       AddToPlayer=175, Holster=189
 //   - Removed wrong slots (167=SUB_DoNothing, 191=SUB_DoNothing)
-//   - Vtable is static array (220 entries) — same safe approach as stub
-//   - Engine fns resolved from engfuncs scan (same as stub — works)
+//   - Vtable is static array (220 entries) - same safe approach as stub
+//   - Engine fns resolved from engfuncs scan (same as stub - works)
 //   - GetSavedBytes() now available from hooks.cpp for CallOrig trampoline
 //
 // HOW THE VTABLE SWAP WORKS:
-//   1. Factory calls CallOrigJanus1(edict) — original allocates+constructs object
+//   1. Factory calls CallOrigJanus1(edict) - original allocates+constructs object
 //   2. Object is at: *(*(edict + 0x238) + 0x80)  [confirmed from IDA pev_layout.txt]
 //   3. We overwrite the vtable pointer at object+0 with our g_vtable
 //   4. All subsequent engine calls go through our implementations
@@ -45,7 +45,7 @@ static void ResolveEngineFns()
 }
 
 // -------------------------------------------------------------------------
-// Vtable — static array, 220 slots (same as working stub)
+// Vtable - static array, 220 slots (same as working stub)
 // Filled by BuildVtable(): copy M79 vtable, override our slots
 // -------------------------------------------------------------------------
 static void*  g_vtable[220]  = {};
@@ -59,7 +59,7 @@ static void** g_m79VtablePtr = nullptr;
 // [ 165] 0x10F28D80 sub_10F28D80  = WeaponIdle (thunk -> sub_10F294E0 which fires rocket)
 // [ 175] 0x10F29930 sub_10F29930  = AddToPlayer
 // [ 189] 0x10F28D90 sub_10F28D90  = Holster
-// NOTE: slots 166/167/191 = SUB_DoNothing (past vtable real end — DO NOT USE)
+// NOTE: slots 166/167/191 = SUB_DoNothing (past vtable real end - DO NOT USE)
 static const int SLOT_Spawn       = 3;
 static const int SLOT_Precache    = 4;
 static const int SLOT_Deploy      = 102;
@@ -74,7 +74,7 @@ static const uintptr_t RVA_CM79_vtable = 0x159FA04;
 // Our virtual method implementations (__fastcall = thiscall-compatible)
 // -------------------------------------------------------------------------
 
-// Slot 4: Precache — loads janus1 assets
+// Slot 4: Precache - loads janus1 assets
 static int __fastcall J1_Precache(void* self, void* /*edx*/)
 {
     Log("[janus1] Precache\n");
@@ -95,7 +95,7 @@ static int __fastcall J1_Precache(void* self, void* /*edx*/)
         Log("[janus1] event handle=%d\n", ev);
     }
 
-    // Let M79's Precache also run — it registers the m79_rocket entity class
+    // Let M79's Precache also run - it registers the m79_rocket entity class
     // and precaches the rocket's own model. We need this for the rocket to exist.
     if (g_m79VtablePtr)
     {
@@ -107,7 +107,7 @@ static int __fastcall J1_Precache(void* self, void* /*edx*/)
     return 1;
 }
 
-// Slot 3: Spawn — delegate to M79 (sets model, movetype, solid)
+// Slot 3: Spawn - delegate to M79 (sets model, movetype, solid)
 static void __fastcall J1_Spawn(void* self, void* /*edx*/)
 {
     Log("[janus1] Spawn self=%p\n", self);
@@ -119,7 +119,7 @@ static void __fastcall J1_Spawn(void* self, void* /*edx*/)
     Log("[janus1] Spawn done\n");
 }
 
-// Slot 102: Deploy — delegate to M79
+// Slot 102: Deploy - delegate to M79
 static int __fastcall J1_Deploy(void* self, void* /*edx*/)
 {
     Log("[janus1] Deploy\n");
@@ -131,7 +131,7 @@ static int __fastcall J1_Deploy(void* self, void* /*edx*/)
     return 1;
 }
 
-// Slot 165: WeaponIdle — M79 fires rocket from here (checks ammo, spawns rocket, plays event)
+// Slot 165: WeaponIdle - M79 fires rocket from here (checks ammo, spawns rocket, plays event)
 static void __fastcall J1_WeaponIdle(void* self, void* /*edx*/)
 {
     if (g_m79VtablePtr)
@@ -167,7 +167,7 @@ static void __fastcall J1_Holster(void* self, void* /*edx*/, int skiplocal)
 }
 
 // -------------------------------------------------------------------------
-// BuildVtable — copy M79's 220-slot vtable, then patch our overrides
+// BuildVtable - copy M79's 220-slot vtable, then patch our overrides
 // -------------------------------------------------------------------------
 static bool BuildVtable(uintptr_t mpBase)
 {
@@ -208,7 +208,7 @@ static bool BuildVtable(uintptr_t mpBase)
 }
 
 // -------------------------------------------------------------------------
-// Factory trampoline — temporarily restores original bytes, calls original,
+// Factory trampoline - temporarily restores original bytes, calls original,
 // then re-patches our hook
 // -------------------------------------------------------------------------
 static uint8_t g_origBytes[5] = {};
@@ -233,7 +233,7 @@ static void CallOrigJanus1(int edict)
 }
 
 // -------------------------------------------------------------------------
-// Factory — entry point hook for weapon_janus1
+// Factory - entry point hook for weapon_janus1
 //
 // IDA confirms: weapon_janus1(int edict) where edict is entvars_t*-ish ptr
 // Object is found at: *(*(edict + 0x238) + 0x80)
@@ -284,7 +284,7 @@ void __cdecl Janus1_Factory(int edict)
 }
 
 // -------------------------------------------------------------------------
-// PostInit — called after Hooks_Install() from dllmain.cpp
+// PostInit - called after Hooks_Install() from dllmain.cpp
 // -------------------------------------------------------------------------
 void Janus1_PostInit(uintptr_t mpBase)
 {
