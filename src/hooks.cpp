@@ -5,8 +5,8 @@
 #include "hlsdk/sdk.h"
 #include <cstring>
 
-enginefuncs_t* g_engfuncs = nullptr;
-float*         g_pTime    = nullptr;
+// g_pTime is declared extern in sdk.h, defined here
+float* g_pTime = nullptr;
 
 static uintptr_t g_mpBase = 0;
 uintptr_t GetMpBase() { return g_mpBase; }
@@ -77,41 +77,20 @@ bool WriteJmp5(uintptr_t from, uintptr_t to, uint8_t* outOrig)
 }
 
 // -------------------------------------------------------------------------
-// Resolve gpGlobals and engfuncs
-// RVA_engfuncs = 0x1E51878  (confirmed from log: engfuncs @ mp+0x1E51878
-//                             pfnPrecacheModel=0x03125190 which is valid hw.dll)
+// Resolve gpGlobals->time only.
+// Individual engine fns are resolved by each weapon's PostInit.
 // -------------------------------------------------------------------------
-static const uintptr_t RVA_engfuncs = 0x1E51878;
-
-static bool ResolveGlobals(HMODULE hMp)
+static bool ResolveGlobalsTime(HMODULE hMp)
 {
     uintptr_t base = (uintptr_t)hMp;
-
-    // gpGlobals->time
     uint32_t pGlobals = 0;
     if (!SafeRead32(base + RVA_pGlobals, pGlobals) || !pGlobals)
     {
-        Log("[hooks] gpGlobals ptr null\n");
+        Log("[hooks] gpGlobals ptr null at mp+0x%zX\n", RVA_pGlobals);
         return false;
     }
     g_pTime = reinterpret_cast<float*>((uintptr_t)pGlobals);
     Log("[hooks] gpGlobals @ 0x%08X  time=%.3f\n", pGlobals, *g_pTime);
-
-    // Engfuncs — fixed RVA confirmed from logs
-    static enginefuncs_t ef;
-    void* engfuncsPtr = reinterpret_cast<void*>(base + RVA_engfuncs);
-    __try { memcpy(&ef, engfuncsPtr, sizeof(ef)); }
-    __except(EXCEPTION_EXECUTE_HANDLER)
-    {
-        Log("[hooks] Failed to read engfuncs\n");
-        return false;
-    }
-    g_engfuncs = &ef;
-    Log("[hooks] engfuncs @ mp+0x%zX  pfnPrecacheModel=0x%08X  pfnPrecacheSound=0x%08X\n",
-        RVA_engfuncs,
-        (uint32_t)(uintptr_t)ef.pfnPrecacheModel,
-        (uint32_t)(uintptr_t)ef.pfnPrecacheSound);
-
     return true;
 }
 
@@ -129,7 +108,7 @@ bool Hooks_Install(HMODULE hMp)
     g_mpBase = (uintptr_t)hMp;
     Log("[hooks] Hooks_Install mp=0x%08zX\n", g_mpBase);
 
-    if (!ResolveGlobals(hMp)) return false;
+    if (!ResolveGlobalsTime(hMp)) return false;
 
     int n = 0;
     for (int i = 0; i < g_hookCount; i++)

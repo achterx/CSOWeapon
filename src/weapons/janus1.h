@@ -1,12 +1,23 @@
 #pragma once
-// janus1.h — CJanus1, written HLSDK/ReGameDLL style
+// janus1.h — CJanus1 grenade launcher (no secondary attack, like M79)
+// Follows ReGameDLL/HLSDK weapon pattern exactly.
+
 #include "../hlsdk/cso_baseweapon.h"
 
-// Janus-1 weapon ID in CSNZ
-#define WEAPON_JANUS1       570
-#define JANUS1_MAX_CLIP     1
-#define JANUS1_DEFAULT_GIVE 1
-#define JANUS1_WEIGHT       15
+// Janus-1 weapon constants
+#define WEAPON_JANUS1           570
+#define JANUS1_MAX_CLIP         1
+#define JANUS1_DEFAULT_GIVE     1
+#define JANUS1_WEIGHT           15
+
+// Animation indices (from client model — same as M79)
+enum janus1_e
+{
+    JANUS1_IDLE   = 0,
+    JANUS1_SHOOT  = 1,
+    JANUS1_RELOAD = 2,
+    JANUS1_DRAW   = 3,
+};
 
 class CJanus1 : public CBasePlayerWeapon
 {
@@ -14,9 +25,9 @@ public:
     void Spawn()   override;
     void Precache() override;
     int  GetItemInfo(ItemInfo* p) override;
-    int  AddToPlayer(CBasePlayer* pPlayer) override;
-    BOOL Deploy() override;
+    BOOL Deploy()  override;
     void Holster(int skiplocal = 0) override;
+    BOOL AddToPlayer(CBasePlayer* pPlayer) override;
     void PrimaryAttack()  override;
     void SecondaryAttack() override;
     void WeaponIdle()     override;
@@ -25,5 +36,8 @@ public:
     BOOL UseDecrement()   override { return FALSE; }
 };
 
-// Called after hooks are installed — resolves engine fns, builds vtable
+// Called from dllmain after Hooks_Install succeeds
 void Janus1_PostInit(uintptr_t mpBase);
+
+// The factory hook — replaces weapon_janus1 entry point
+void __cdecl Janus1_Factory(entvars_t* pev);

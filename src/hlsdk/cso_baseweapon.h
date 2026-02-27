@@ -1,0 +1,275 @@
+#pragma once
+// cso_baseweapon.h
+// CBaseEntity → CBaseDelay → CBaseAnimating → CBasePlayerItem → CBasePlayerWeapon
+// Reconstructed from ReGameDLL source + IDA field offsets
+// This matches the real CSNZ server memory layout.
+
+#include "sdk.h"
+
+// -----------------------------------------------------------------------
+// Forward declarations
+// -----------------------------------------------------------------------
+class CBaseEntity;
+class CBasePlayerItem;
+class CBasePlayerWeapon;
+class CBasePlayer;
+
+// -----------------------------------------------------------------------
+// ItemInfo — passed to GetItemInfo()
+// -----------------------------------------------------------------------
+struct ItemInfo
+{
+    int         iSlot;
+    int         iPosition;
+    const char* pszAmmo1;
+    int         iMaxAmmo1;
+    const char* pszAmmo2;
+    int         iMaxAmmo2;
+    const char* pszName;
+    int         iMaxClip;
+    int         iId;
+    int         iFlags;
+    int         iWeight;
+};
+
+// -----------------------------------------------------------------------
+// WEAPON_NOCLIP
+// -----------------------------------------------------------------------
+#define WEAPON_NOCLIP  -1
+
+// -----------------------------------------------------------------------
+// edict helpers
+// From real GoldSrc: edict_t->pvPrivateData is at offset 0x10 (16 bytes)
+//   edict_t layout: free(4), serial(4), area_prev(4), area_next(4), pvPrivateData(4), entvars_t(...)
+// entvars_t->pContainingEntity is the last field before inline entvars, BUT in GoldSrc
+// entvars_t is stored INLINE in edict_t starting at offset 0x14.
+// pContainingEntity in entvars_t points back to the edict.
+// -----------------------------------------------------------------------
+#define EDICT_PVPRIVATE_OFFSET  0x10   // pvPrivateData offset in edict_t
+
+inline edict_t* PEV_TO_EDICT(entvars_t* pev)
+{
+    // pev->pContainingEntity: in the real entvars_t layout (as inline in edict_t at +0x14),
+    // the pContainingEntity field is NOT the first field of entvars_t.
+    // In GoldSrc: entvars_t is INLINE, pContainingEntity at entvars_t+0x208.
+    // BUT: the engine sets edict->v.pContainingEntity = edict before calling factory.
+    // So: (edict_t*)((char*)pev - 0x14) — because pev = &edict->v = edict + 0x14
+    // This is the standard GoldSrc trick: edict = container of pev
+    return reinterpret_cast<edict_t*>(reinterpret_cast<uint8_t*>(pev) - 0x14);
+}
+
+inline void* EDICT_PRIVATE(edict_t* e)
+{
+    if (!e) return nullptr;
+    return *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(e) + EDICT_PVPRIVATE_OFFSET);
+}
+
+// -----------------------------------------------------------------------
+// CBaseEntity
+// -----------------------------------------------------------------------
+class CBaseEntity
+{
+public:
+    // vtable is at [0] — compiler generated
+    entvars_t*  pev;            // +0x04  (after vtable ptr at +0x00)
+    CBaseEntity* m_pGoalEnt;    // +0x08
+    CBaseEntity* m_pLink;       // +0x0C
+
+    // Virtual methods (subset — must match CSNZ's vtable order exactly)
+    virtual void Spawn()        {}
+    virtual void Precache()     {}
+    virtual void KeyValue(void* pkvd) {}
+    virtual int  Save(void*)    { return 0; }
+    virtual int  Restore(void*) { return 0; }
+    virtual void SetObjectCollisionBox() {}
+    virtual int  Classify()     { return 0; }
+    virtual void DeathNotice(entvars_t*) {}
+    virtual void TraceAttack(entvars_t*, float, Vector, void*, int) {}
+    virtual int  TakeDamage(entvars_t*, entvars_t*, float, int) { return 0; }
+    virtual int  TakeHealth(float, int) { return 0; }
+    virtual void Killed(entvars_t*, int) {}
+    virtual int  BloodColor()   { return 0; }
+    virtual void TraceBleed(float, Vector, void*, int) {}
+    virtual BOOL IsTriggered(CBaseEntity*) { return FALSE; }
+    virtual void* MyMonsterPointer() { return nullptr; }
+    virtual void* MySquadMonsterPointer() { return nullptr; }
+    virtual int  GetToggleState() { return 0; }
+    virtual void AddPoints(int, BOOL) {}
+    virtual void AddPointsToTeam(int, BOOL) {}
+    virtual BOOL AddPlayerItem(CBasePlayerItem*) { return FALSE; }
+    virtual BOOL RemovePlayerItem(CBasePlayerItem*) { return FALSE; }
+    virtual int  GiveAmmo(int, char*, int) { return -1; }
+    virtual float GetDelay() { return 0; }
+    virtual int  IsMoving() { return 0; }
+    virtual void OverrideReset() {}
+    virtual int  DamageDecal(int) { return 0; }
+    virtual void SetToggleState(int) {}
+    virtual void StartSneaking() {}
+    virtual void StopSneaking() {}
+    virtual BOOL OnControls(entvars_t*) { return FALSE; }
+    virtual BOOL IsSneaking() { return FALSE; }
+    virtual BOOL IsAlive() { return FALSE; }
+    virtual BOOL IsBSPModel() { return FALSE; }
+    virtual BOOL ReflectGauss() { return FALSE; }
+    virtual BOOL HasTarget(string_t) { return FALSE; }
+    virtual BOOL IsInWorld() { return TRUE; }
+    virtual BOOL IsPlayer() { return FALSE; }
+    virtual BOOL IsNetClient() { return FALSE; }
+    virtual const char* TeamID() { return ""; }
+    virtual CBaseEntity* GetNextTarget() { return nullptr; }
+    virtual void Think() {}
+    virtual void Touch(CBaseEntity*) {}
+    virtual void Use(CBaseEntity*, CBaseEntity*, int, float) {}
+    virtual void Blocked(CBaseEntity*) {}
+    virtual CBaseEntity* Respawn() { return nullptr; }
+    virtual void UpdateOnRemove() {}
+    virtual BOOL FBecomeProne(CBaseEntity*) { return FALSE; }
+    virtual Vector Center() { return pev ? pev->origin : Vector(); }
+    virtual Vector EyePosition() { return pev ? pev->origin : Vector(); }
+    virtual Vector EarPosition() { return pev ? pev->origin : Vector(); }
+    virtual Vector BodyTarget(const Vector&) { return pev ? pev->origin : Vector(); }
+    virtual int  Illumination() { return 0; }
+    virtual BOOL FVisible(CBaseEntity*) { return FALSE; }
+    virtual BOOL FVisible(const Vector&) { return FALSE; }
+
+    // Non-virtual helpers
+    edict_t* edict() { return PEV_TO_EDICT(pev); }
+};
+
+// -----------------------------------------------------------------------
+// CBaseDelay (adds m_flDelay, m_iszKillTarget)
+// -----------------------------------------------------------------------
+class CBaseDelay : public CBaseEntity
+{
+public:
+    float       m_flDelay;          // +0x10
+    string_t    m_iszKillTarget;    // +0x14
+    // SUB_UseTargets etc are non-virtual, not needed
+};
+
+// -----------------------------------------------------------------------
+// CBaseAnimating (adds anim fields)
+// -----------------------------------------------------------------------
+class CBaseAnimating : public CBaseDelay
+{
+public:
+    float       m_flFrameRate;      // +0x18
+    float       m_flGroundSpeed;    // +0x1C
+    float       m_flLastEventCheck; // +0x20
+    BOOL        m_fSequenceFinished;// +0x24
+    BOOL        m_fSequenceLoops;   // +0x28
+};
+
+// -----------------------------------------------------------------------
+// CBasePlayerItem
+// -----------------------------------------------------------------------
+class CBasePlayerItem : public CBaseAnimating
+{
+public:
+    // Additional virtuals beyond CBaseEntity
+    virtual BOOL CanDrop() { return TRUE; }
+    virtual BOOL Deploy() { return TRUE; }
+    virtual BOOL CanDeploy() { return TRUE; }
+    virtual BOOL IsWeapon() { return FALSE; }
+    virtual void Holster(int skiplocal = 0) {}
+    virtual void UpdateItemInfo() {}
+    virtual void ItemPostFrame() {}
+    virtual int  PrimaryAmmoIndex() { return -1; }
+    virtual int  SecondaryAmmoIndex() { return -1; }
+    virtual int  UpdateClientData(CBasePlayer*) { return 0; }
+    virtual CBasePlayerItem* GetWeaponPtr() { return nullptr; }
+    virtual float GetMaxSpeed() { return 250.f; }
+    virtual int  iItemSlot() { return 0; }
+    virtual int  GetItemInfo(ItemInfo*) { return 0; }
+    virtual BOOL AddToPlayer(CBasePlayer*) { return FALSE; }
+    virtual BOOL AddDuplicate(CBasePlayerItem*) { return FALSE; }
+
+    // Public helpers (non-virtual, defined in ReGameDLL)
+    void FallInit();
+    void CheckRespawn();
+
+    // Static data
+    static ItemInfo m_ItemInfoArray[32];
+    static void*    m_AmmoInfoArray;
+    static void*    m_SaveData;
+
+    // Fields
+    CBasePlayer*      m_pPlayer;    // +0x2C  (after CBaseAnimating's fields)
+    CBasePlayerItem*  m_pNext;      // +0x30
+    int               m_iId;        // +0x34  WEAPON_???
+};
+
+// -----------------------------------------------------------------------
+// CBasePlayerWeapon — the class all CS weapons inherit
+// Layout matches ReGameDLL weapons.h exactly
+// -----------------------------------------------------------------------
+class CBasePlayerWeapon : public CBasePlayerItem
+{
+public:
+    // Additional virtuals
+    virtual int  ExtractAmmo(CBasePlayerWeapon*) { return 0; }
+    virtual int  ExtractClipAmmo(CBasePlayerWeapon*) { return 0; }
+    virtual int  AddWeapon() { ExtractAmmo(this); return 1; }
+    virtual BOOL PlayEmptySound() { return TRUE; }
+    virtual void ResetEmptySound() {}
+    virtual void SendWeaponAnim(int iAnim, int skiplocal = 0) {}
+    virtual BOOL IsUseable() { return TRUE; }
+    virtual void PrimaryAttack()   {}
+    virtual void SecondaryAttack() {}
+    virtual void Reload()          {}
+    virtual void WeaponIdle()      {}
+    virtual void RetireWeapon()    {}
+    virtual BOOL ShouldWeaponIdle() { return FALSE; }
+    virtual BOOL UseDecrement()    { return FALSE; }
+
+    // Non-virtual methods (use M79 vtable delegation for these)
+    // DefaultDeploy, DefaultReload, GetNextAttackDelay are in game code
+
+    // Static
+    static void* m_SaveData;
+
+    // Fields (from ReGameDLL weapons.h CBasePlayerWeapon section)
+    int             m_iPlayEmptySound;      // +0x38
+    int             m_fFireOnEmpty;         // +0x3C
+    float           m_flNextPrimaryAttack;  // +0x40
+    float           m_flNextSecondaryAttack;// +0x44
+    float           m_flTimeWeaponIdle;     // +0x48
+    int             m_iPrimaryAmmoType;     // +0x4C
+    int             m_iSecondaryAmmoType;   // +0x50
+    int             m_iClip;               // +0x54
+    int             m_iClientClip;         // +0x58
+    int             m_iClientWeaponState;  // +0x5C
+    int             m_fInReload;           // +0x60
+    int             m_fInSpecialReload;    // +0x64
+    int             m_iDefaultAmmo;        // +0x68
+    int             m_iShellId;            // +0x6C
+    float           m_fMaxSpeed;           // +0x70
+    bool            m_bDelayFire;          // +0x74
+    BOOL            m_iDirection;          // +0x78
+    bool            m_bSecondarySilencerOn;// +0x7C
+    float           m_flAccuracy;          // +0x80
+    float           m_flLastFire;          // +0x84
+    int             m_iShotsFired;         // +0x88
+    Vector          m_vVecAiming;          // +0x8C
+    string_t        model_name;            // +0x98
+    float           m_flGlock18Shoot;      // +0x9C
+    int             m_iGlock18ShotsFired;  // +0xA0
+    float           m_flFamasShoot;        // +0xA4
+    int             m_iFamasShotsFired;    // +0xA8
+    float           m_fBurstSpread;        // +0xAC
+    int             m_iWeaponState;        // +0xB0
+    float           m_flNextReload;        // +0xB4
+    float           m_flDecreaseShotsFired;// +0xB8
+    unsigned short  m_usFireGlock18;       // +0xBC
+    unsigned short  m_usFireFamas;         // +0xBE
+    float           m_flPrevPrimaryAttack; // +0xC0
+    float           m_flLastFireTime;      // +0xC4
+
+    // CSNZ-specific extra fields (appended after standard CS fields)
+    // These are at higher offsets — values from IDA field dump
+    // m_usFireEvent is at this+0x1E8 (confirmed: WPN_EVENT offset from IDA)
+    // But our struct offset won't match that exactly since we're reconstructing.
+    // We'll use a padding array to get to the right offsets.
+    // Rather than guess, we store it locally and write it directly on init.
+    unsigned short  m_usFireEvent;          // fire event handle (PRECACHE_EVENT result)
+};

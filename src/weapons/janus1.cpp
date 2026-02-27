@@ -1,112 +1,135 @@
-// janus1.cpp — CJanus1 grenade launcher, written ReGameDLL/HLSDK style
+// janus1.cpp — CJanus1 grenade launcher implementation
+// Follows CHEGrenade pattern from ReGameDLL exactly.
 //
-// Key facts learned from ReGameDLL source:
+// HOW IT WORKS:
+// 1. Janus1_Factory is registered to replace the weapon_janus1 entry point.
+// 2. When the engine spawns weapon_janus1, our factory runs.
+// 3. We call the ORIGINAL factory (which allocates the object properly).
+// 4. We find the allocated object via edict->pvPrivateData.
+// 5. We swap its vtable to CJanus1's vtable.
+// 6. All virtual calls now go through our CJanus1 methods.
+// 7. For PrimaryAttack/Reload we delegate to M79's vtable (which works).
 //
-// 1. FACTORY SIGNATURE:
-//    LINK_ENTITY_TO_CLASS expands to:
-//      void weapon_janus1(entvars_t* pev) { GetClassPtr<T>((T*)pev); }
-//    So the factory receives entvars_t* — NOT int edict.
-//    Our hook must match: void __cdecl Janus1_Factory(entvars_t* pev)
-//
-// 2. OBJECT ALLOCATION (GetClassPtr):
-//    pev is cast as the "allocation key". The engine already called
-//    ALLOC_PRIVATE(ENT(pev), sizeof(T)) before the factory runs.
-//    GET_PRIVATE(ENT(pev)) returns the allocated block.
-//    Then: new(pev) T  =>  placement-new into that block.
-//    Result: object lives at edict->pvPrivateData
-//    To find it: edict_t* e = ENT(pev); T* obj = (T*)GET_PRIVATE(e)
-//    In raw terms: edict = *(entvars_t+4); obj = *(edict+pvPrivateData_offset)
-//
-// 3. VTABLE SWAP STRATEGY:
-//    After calling original factory (which constructs game's CJanus1),
-//    we find the object via edict->pvPrivateData and replace vtable[0]
-//    with CJanus1's compiler-generated vtable pointer.
-//
-// 4. ENGINE FUNCTIONS:
-//    PRECACHE_MODEL etc. are macros that call g_engfuncs.pfnPrecacheModel
-//    The engfuncs table is at mp+0x1E51878 (confirmed from logs).
-//    pfnPrecacheModel = engfuncs[0], pfnPrecacheSound = engfuncs[1]
-//    pfnPrecacheEvent = confirmed at mp+0x1E51A78 from IDA M79 decompile
+// WHY M79 DELEGATION WORKS:
+// CJanus1 uses the SAME model, the SAME ammo, the SAME projectile as M79.
+// M79's PrimaryAttack and Reload are confirmed working on this server.
+// So we just let them handle firing/reloading, and override everything else.
 
 #include "janus1.h"
 #include "../hooks.h"
 #include "../logger.h"
 #include "../hlsdk/mp_offsets.h"
-#include <cstring>
 #include <new>
 #include <windows.h>
 
 // -----------------------------------------------------------------------
-// Engine function implementations — defined in cso_baseweapon.h as externs
+// Engine function pointers needed by PRECACHE_* macros (defined in sdk.h).
+// g_pTime and g_pGlobals are already defined in hooks.cpp — we just use them.
+// We define the individual cached fn pointers here; PostInit fills them.
 // -----------------------------------------------------------------------
-pfnPrecacheModel_t g_fnPrecacheModel = nullptr;
-pfnPrecacheSound_t g_fnPrecacheSound = nullptr;
-pfnPrecacheEvent_t g_fnPrecacheEvent = nullptr;
-pfnSetModel_t      g_fnSetModel      = nullptr;
-float*             g_pTime           = nullptr;
+pfnPrecacheModel_t  g_fnPrecacheModel = nullptr;
+pfnPrecacheSound_t  g_fnPrecacheSound = nullptr;
+pfnSetModel_t       g_fnSetModel      = nullptr;
+pfnPrecacheEvent_t  g_fnPrecacheEvent = nullptr;
+// g_pTime is defined in hooks.cpp (extern in sdk.h) — do NOT redefine here.
+// g_pGlobals is a janus1-local variable:
+static float* s_pGlobalsBase = nullptr;  // base of globalvars_t struct
 
-// Static member definitions
-void*    CBaseEntity::m_SaveData     = nullptr;
-void*    CBasePlayerItem::m_SaveData = nullptr;
+// Static member definitions (required by linker)
 ItemInfo CBasePlayerItem::m_ItemInfoArray[32] = {};
-void*    CBasePlayerItem::m_AmmoInfoArray = nullptr;
-void*    CBasePlayerWeapon::m_SaveData = nullptr;
+void*    CBasePlayerItem::m_AmmoInfoArray     = nullptr;
+void*    CBasePlayerItem::m_SaveData          = nullptr;
+void*    CBasePlayerWeapon::m_SaveData        = nullptr;
+
+// -----------------------------------------------------------------------
+// M79 vtable delegation helpers
+// -----------------------------------------------------------------------
+static void** g_m79Vtable = nullptr; // CM79 vtable pointer array
+
+// Call a slot on M79's vtable with 'this' = our object
+// This works because CJanus1 and CM79 have compatible layouts
+// (both are CBasePlayerWeapon subclasses with the same field structure)
+template<typename RetT, typename... Args>
+static RetT M79_Call(int slot, void* self, Args... args)
+{
+    if (!g_m79Vtable || slot >= 220) {
+        if constexpr (!std::is_void<RetT>::value) return RetT{};
+        else return;
+    }
+    typedef RetT(__thiscall* Fn)(void*, Args...);
+    return reinterpret_cast<Fn>(g_m79Vtable[slot])(self, args...);
+}
 
 // -----------------------------------------------------------------------
 // CJanus1 method implementations
 // -----------------------------------------------------------------------
+
 void CJanus1::Spawn()
 {
     Precache();
+
     m_iId = WEAPON_JANUS1;
     SET_MODEL(edict(), "models/w_janus1.mdl");
+
     m_iDefaultAmmo = JANUS1_DEFAULT_GIVE;
-    m_iClip = JANUS1_MAX_CLIP;
-    // FallInit equivalent — let weapon fall to ground
-    pev->movetype = 6;   // MOVETYPE_TOSS
-    pev->solid    = 1;   // SOLID_TRIGGER
-    Log("[janus1] Spawn done\n");
+    m_iClip        = JANUS1_MAX_CLIP;
+
+    // FallInit — let weapon fall to ground when dropped
+    // Delegate to M79's Spawn which calls FallInit
+    // (M79 slot 0 = Spawn, confirmed from vtable dump)
+    // Actually we implement FallInit ourselves since Spawn would recurse
+    if (pev) {
+        pev->movetype = 6;  // MOVETYPE_TOSS
+        pev->solid    = 1;  // SOLID_TRIGGER
+    }
+
+    Log("[janus1] Spawn done, id=%d clip=%d\n", m_iId, m_iClip);
 }
 
 void CJanus1::Precache()
 {
     Log("[janus1] Precache\n");
+
     PRECACHE_MODEL("models/v_janus1.mdl");
     PRECACHE_MODEL("models/w_janus1.mdl");
     PRECACHE_SOUND("weapons/janus1-1.wav");
     PRECACHE_SOUND("weapons/janus1-2.wav");
     PRECACHE_SOUND("weapons/janus1_reload.wav");
-    m_usFireEvent = (unsigned short)PRECACHE_EVENT(1, "events/janus1.sc");
-    Log("[janus1] Precache done, event=%d\n", (int)m_usFireEvent);
+
+    // PRECACHE_EVENT returns a handle we store for PLAYBACK_EVENT_FULL
+    m_usFireEvent = PRECACHE_EVENT(1, "events/janus1.sc");
+
+    Log("[janus1] Precache done, evHdl=%d\n", (int)m_usFireEvent);
 }
 
 int CJanus1::GetItemInfo(ItemInfo* p)
 {
-    p->pszName    = "weapon_janus1";
-    p->pszAmmo1   = "janus1_rocket";
-    p->iMaxAmmo1  = 5;
-    p->pszAmmo2   = nullptr;
-    p->iMaxAmmo2  = -1;
-    p->iMaxClip   = JANUS1_MAX_CLIP;
-    p->iSlot      = 3;
-    p->iPosition  = 6;
-    p->iId        = m_iId = WEAPON_JANUS1;
-    p->iFlags     = 0;
-    p->iWeight    = JANUS1_WEIGHT;
+    p->pszName   = "weapon_janus1";
+    p->pszAmmo1  = "m79_rocket";   // same ammo type as M79
+    p->iMaxAmmo1 = 5;
+    p->pszAmmo2  = nullptr;
+    p->iMaxAmmo2 = -1;
+    p->iMaxClip  = JANUS1_MAX_CLIP;
+    p->iSlot     = 3;
+    p->iPosition = 6;
+    p->iId       = m_iId = WEAPON_JANUS1;
+    p->iFlags    = 0;
+    p->iWeight   = JANUS1_WEIGHT;
     return 1;
 }
 
-int CJanus1::AddToPlayer(CBasePlayer* pPlayer)
+BOOL CJanus1::AddToPlayer(CBasePlayer* pPlayer)
 {
-    Log("[janus1] AddToPlayer player=%p\n", (void*)pPlayer);
+    Log("[janus1] AddToPlayer pPlayer=%p\n", (void*)pPlayer);
     m_pPlayer = pPlayer;
-    // Set weapon bit on player (pPlayer->pev->weapons |= (1 << m_iId) but
-    // we don't have player layout — delegate to M79 vtable for now)
-    // For a clean implementation call CBasePlayerWeapon::AddToPlayer logic:
-    //   m_pPlayer = pPlayer
-    //   pPlayer->pev->weapons |= (1 << m_iId)
-    //   call CBasePlayerItem::AddToPlayer -> sends gmsgWeapPickup to client
-    // Since we can't call super easily without real engine, log and return TRUE
+    // Call M79's AddToPlayer which does the full weapon registration:
+    //   pPlayer->pev->weapons |= (1 << m_iId)  — sets weapon bit
+    //   sends gmsgWeapPickup to client HUD
+    // We pass 'this' as self — M79 will treat it as CM79, layout is compatible
+    if (g_m79Vtable) {
+        typedef BOOL(__thiscall* Fn)(void*, CBasePlayer*);
+        return reinterpret_cast<Fn>(g_m79Vtable[VTBL_AddToPlayer])(this, pPlayer);
+    }
     return TRUE;
 }
 
@@ -114,9 +137,9 @@ BOOL CJanus1::Deploy()
 {
     Log("[janus1] Deploy\n");
     m_fMaxSpeed = 250.0f;
-    // DefaultDeploy sets view model, player model, animation, anim extension
-    // We'll delegate to M79's Deploy via raw vtable call (sets correct models)
-    // This is safe because our object layout matches M79's layout
+
+    // Delegate to M79's Deploy — sets view model to v_m79.mdl, etc.
+    // Since Janus-1 uses same model as M79, this is correct behavior.
     if (g_m79Vtable) {
         typedef BOOL(__thiscall* Fn)(void*);
         return reinterpret_cast<Fn>(g_m79Vtable[VTBL_Deploy])(this);
@@ -127,217 +150,277 @@ BOOL CJanus1::Deploy()
 void CJanus1::Holster(int skiplocal)
 {
     Log("[janus1] Holster\n");
-    // Standard holster: clear view/weapon models on player
     m_fInReload = FALSE;
-    if (m_pPlayer) {
-        // pPlayer->pev->viewmodel = 0; pPlayer->pev->weaponmodel = 0;
-        // Access via raw pev offset: viewmodel at pev+0x168, weaponmodel at pev+0x16C
-        *reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(m_pPlayer->pev) + 0x168) = 0;
-        *reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(m_pPlayer->pev) + 0x16C) = 0;
+
+    if (g_m79Vtable) {
+        typedef void(__thiscall* Fn)(void*, int);
+        reinterpret_cast<Fn>(g_m79Vtable[VTBL_Holster])(this, skiplocal);
+        return;
+    }
+
+    // Fallback: clear player models manually
+    if (m_pPlayer && m_pPlayer->pev) {
+        m_pPlayer->pev->viewmodel  = 0;
+        m_pPlayer->pev->weaponmodel = 0;
     }
 }
 
 void CJanus1::PrimaryAttack()
 {
-    Log("[janus1] PrimaryAttack t=%.3f clip=%d\n", UTIL_WeaponTimeBase(), m_iClip);
-    if (m_iClip <= 0) {
-        PlayEmptySound();
-        m_flNextPrimaryAttack = UTIL_WeaponTimeBase() + 0.15f;
-        return;
-    }
-    // Delegate to M79's PrimaryAttack — fires rocket the same way
+    // Fully delegate to M79's PrimaryAttack — it fires the grenade projectile
+    // M79's PrimaryAttack checks m_iClip, fires CGrenade projectile,
+    // plays event, sets m_flNextPrimaryAttack, does animation — all correct.
+    Log("[janus1] PrimaryAttack t=%.3f clip=%d\n", SafeTime(), m_iClip);
+
     if (g_m79Vtable) {
         typedef void(__thiscall* Fn)(void*);
         reinterpret_cast<Fn>(g_m79Vtable[VTBL_PrimaryAttack])(this);
+        return;
+    }
+
+    // Fallback: empty click
+    if (m_iClip <= 0) {
+        PlayEmptySound();
+        m_flNextPrimaryAttack = SafeTime() + 0.15f;
     }
 }
 
 void CJanus1::SecondaryAttack()
 {
-    // Janus-1 has no secondary attack
-    m_flNextSecondaryAttack = UTIL_WeaponTimeBase() + 0.5f;
+    // Janus-1 has no secondary attack in this version
+    m_flNextSecondaryAttack = SafeTime() + 0.5f;
 }
 
 void CJanus1::WeaponIdle()
 {
-    if (m_flTimeWeaponIdle > UTIL_WeaponTimeBase())
+    if (m_flTimeWeaponIdle > SafeTime())
         return;
+
     if (m_iClip) {
-        SendWeaponAnim(0 /* idle anim */);
-        m_flTimeWeaponIdle = UTIL_WeaponTimeBase() + 20.0f;
+        SendWeaponAnim(JANUS1_IDLE);
+        m_flTimeWeaponIdle = SafeTime() + 20.0f;
     }
 }
 
 void CJanus1::Reload()
 {
-    Log("[janus1] Reload\n");
-    if (m_pPlayer && m_iClip < JANUS1_MAX_CLIP) {
-        // DefaultReload equivalent via M79
-        if (g_m79Vtable) {
-            typedef void(__thiscall* Fn)(void*);
-            reinterpret_cast<Fn>(g_m79Vtable[VTBL_Reload])(this);
-        }
+    Log("[janus1] Reload clip=%d\n", m_iClip);
+
+    // Delegate to M79's Reload — handles animation, timing, ammo refill
+    if (g_m79Vtable) {
+        typedef void(__thiscall* Fn)(void*);
+        reinterpret_cast<Fn>(g_m79Vtable[VTBL_Reload])(this);
     }
 }
 
 // -----------------------------------------------------------------------
-// Vtable slots from IDA (CSimpleWpn vtable, confirmed)
-// -----------------------------------------------------------------------
-static const int VTBL_Deploy        = 102;
-static const int VTBL_PrimaryAttack = 167;
-static const int VTBL_WeaponIdle    = 165;
-static const int VTBL_Reload        = 166;
-static const int VTBL_AddToPlayer   = 175;
-static const int VTBL_Holster       = 191;
-
-static void** g_m79Vtable   = nullptr;
-static const uintptr_t RVA_CM79_vtable = 0x159FA04;
-
-// -----------------------------------------------------------------------
-// Factory
-//
-// Original: void weapon_janus1(entvars_t* pev) {
-//               GetClassPtr<CJanus1>((CJanus1*)pev);
-//           }
-//
-// GetClassPtr: allocates if needed, then new(pev) CJanus1, sets obj->pev=pev
-// Object is at GET_PRIVATE(ENT(pev)) = edict->pvPrivateData
-//
-// edict layout (GoldSrc): pvPrivateData at offset 0x0C (12 bytes)
-//   edict_t { int free; int serialnumber; link_t area; ... pvPrivateData; }
-//   Actually: pvPrivateData is at edict+0x0C in standard GoldSrc
-//
-// entvars_t -> edict: ENT(pev) reads from engine's edict array
-//   In practice: edict_t* e = *(edict_t**)(pev+4) [pev->pContainingEntity? no]
-//   Actually from GoldSrc: ENT(pev) = pev's container edict
-//   The simplest: pvPrivateData = edict[12] after GetClassPtr runs
+// Factory mechanism
 // -----------------------------------------------------------------------
 
-static uint8_t g_savedBytes[5] = {};
-static bool    g_savedOk       = false;
-static void*   g_cjanus1Vtable = nullptr;
-static bool    g_ready         = false;
+static uint8_t g_savedBytes[5]  = { 0x90,0x90,0x90,0x90,0x90 };
+static bool    g_factoryReady   = false;
 
-typedef void (__cdecl* pfnOrigFactory_t)(entvars_t*);
-
-// Static buffer for placement-new to capture vtable pointer
-static char   g_vtableBuf[sizeof(CJanus1)];
-static bool   g_vtableInit = false;
+// Static buffer + vtable capture
+// We do a placement-new into a static buffer so the compiler generates our
+// vtable and we can capture the vtable pointer.
+alignas(16) static char g_vtableBuf[sizeof(CJanus1)];
+static void*            g_ourVtable = nullptr;
 
 static void InitVtable()
 {
     memset(g_vtableBuf, 0, sizeof(g_vtableBuf));
+    // Placement-new: constructs CJanus1 in static memory, sets up vtable ptr
     CJanus1* dummy = new(g_vtableBuf) CJanus1();
-    g_cjanus1Vtable = *reinterpret_cast<void**>(dummy);
-    g_vtableInit = (g_cjanus1Vtable != nullptr);
-    Log("[janus1] CJanus1 vtable @ %p\n", g_cjanus1Vtable);
+    (void)dummy;
+    g_ourVtable = *reinterpret_cast<void**>(g_vtableBuf);
+    Log("[janus1] CJanus1 vtable captured @ %p\n", g_ourVtable);
 }
 
-static void CallOrigAndSwap(entvars_t* pev)
+// Swap vtable on a game-allocated object
+static void SwapVtable(void* obj)
+{
+    if (!obj || !g_ourVtable) return;
+    DWORD old = 0;
+    if (VirtualProtect(obj, sizeof(void*), PAGE_EXECUTE_READWRITE, &old)) {
+        void* prev = *reinterpret_cast<void**>(obj);
+        *reinterpret_cast<void**>(obj) = g_ourVtable;
+        VirtualProtect(obj, sizeof(void*), old, &old);
+        Log("[janus1] Vtable swapped %p -> %p (CJanus1)\n", prev, g_ourVtable);
+    } else {
+        Log("[janus1] VirtualProtect failed on obj=%p\n", obj);
+    }
+}
+
+typedef void(__cdecl* pfnFactory_t)(entvars_t*);
+
+// Call original factory (temporarily restore bytes), then re-hook
+static void CallOrigFactory(entvars_t* pev)
 {
     uintptr_t fnAddr = GetMpBase() + RVA_weapon_janus1;
 
-    // Restore, call, re-patch
+    // Restore original bytes
     DWORD old = 0;
     VirtualProtect((void*)fnAddr, 5, PAGE_EXECUTE_READWRITE, &old);
     memcpy((void*)fnAddr, g_savedBytes, 5);
     VirtualProtect((void*)fnAddr, 5, old, &old);
 
-    reinterpret_cast<pfnOrigFactory_t>(fnAddr)(pev);
+    // Call original — allocates the object, runs constructor, sets vtable
+    reinterpret_cast<pfnFactory_t>(fnAddr)(pev);
 
+    // Re-install our hook immediately
     WriteJmp5(fnAddr, (uintptr_t)Janus1_Factory, nullptr);
-
-    // Find object: pvPrivateData is at offset 0x0C in edict_t (GoldSrc standard)
-    // ENT(pev) is the edict — but we don't have the engine's ENT macro.
-    // From IDA: the factory decompile showed edict_t* at *(pev+4) in some builds.
-    // More reliably: scan the edict array. But easiest: use the known offset.
-    // pev->pContainingEntity (edict_t*) is at pev+0 in entvars_t
-    // Actually in GoldSrc entvars_t: first field IS pContainingEntity (edict_t*)
-    void* obj = nullptr;
-    __try {
-        edict_t* edict = *reinterpret_cast<edict_t**>(pev); // pev->pContainingEntity
-        // pvPrivateData at edict+0x0C
-        obj = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(edict) + 0x0C);
-    }
-    __except(EXCEPTION_EXECUTE_HANDLER) {
-        Log("[janus1] Exception finding obj from pev=%p\n", pev);
-        return;
-    }
-
-    if (!obj) { Log("[janus1] obj null\n"); return; }
-
-    Log("[janus1] obj=%p  orig_vtable=%p\n",
-        obj, *reinterpret_cast<void**>(obj));
-
-    // Swap vtable
-    DWORD old2 = 0;
-    if (VirtualProtect(obj, 4, PAGE_EXECUTE_READWRITE, &old2)) {
-        *reinterpret_cast<void**>(obj) = g_cjanus1Vtable;
-        VirtualProtect(obj, 4, old2, &old2);
-        Log("[janus1] Vtable swapped -> CJanus1 @ %p\n", g_cjanus1Vtable);
-    }
 }
 
 void __cdecl Janus1_Factory(entvars_t* pev)
 {
-    Log("[janus1] Factory pev=%p t=%.3f\n", pev, UTIL_WeaponTimeBase());
-    if (!g_ready) { Log("[janus1] Not ready\n"); return; }
-    CallOrigAndSwap(pev);
+    Log("[janus1] Factory pev=%p t=%.3f\n", pev, SafeTime());
+
+    if (!g_factoryReady) {
+        Log("[janus1] Factory: not ready yet, calling original\n");
+        // Call original but don't swap vtable — weapon will use game's code
+        CallOrigFactory(pev);
+        return;
+    }
+
+    // Call original factory to properly allocate and construct the object
+    CallOrigFactory(pev);
+
+    // Find the allocated object
+    // In GoldSrc: pev is actually the pointer to the inline entvars_t inside edict_t.
+    // edict_t layout: [free:4][serial:4][area_prev:4][area_next:4][pvPrivateData:4][entvars_t...]
+    // pvPrivateData is at edict+0x10. edict_t starts 0x14 bytes before pev? No —
+    // actually pev IS a pointer to entvars_t which is stored inline in edict_t at offset 0x14.
+    // So: edict = (uint8_t*)pev - 0x14, pvPrivateData at edict+0x10.
+    //
+    // BUT: CSNZ may store things differently. Let's use the safe approach:
+    // edict_t* e = (edict_t*)((uint8_t*)pev - offsetof(edict_t, v))
+    // offsetof(edict_t, v) = 0x14 (from our struct definition above, after 5 x 4-byte fields)
+    //
+    // Actually safer: pev->pContainingEntity is at pev+0x208 (in the full entvars_t struct)
+    // and it points to the edict. Use that.
+
+    void* obj = nullptr;
+    __try {
+        // Method 1: pev->pContainingEntity (at entvars_t offset 0x208) -> edict
+        // Then edict->pvPrivateData (at edict offset 0x10)
+        edict_t* edict = *reinterpret_cast<edict_t**>(
+            reinterpret_cast<uint8_t*>(pev) + 0x208); // pContainingEntity
+
+        if (edict) {
+            obj = *reinterpret_cast<void**>(
+                reinterpret_cast<uint8_t*>(edict) + 0x10); // pvPrivateData
+        }
+    }
+    __except(EXCEPTION_EXECUTE_HANDLER) {
+        obj = nullptr;
+    }
+
+    if (!obj) {
+        // Method 2: if pev is the inline entvars_t in edict_t at offset 0x14
+        // edict_t* = pev - 0x14, pvPrivateData at that - 0x10
+        __try {
+            uint8_t* possibleEdict = reinterpret_cast<uint8_t*>(pev) - 0x14;
+            void* candidate = *reinterpret_cast<void**>(possibleEdict + 0x10);
+            // Sanity: candidate should be readable and in a reasonable range
+            if (candidate && (uintptr_t)candidate > 0x10000000) {
+                obj = candidate;
+                Log("[janus1] Found obj via method2: %p\n", obj);
+            }
+        }
+        __except(EXCEPTION_EXECUTE_HANDLER) {}
+    }
+
+    if (!obj) {
+        Log("[janus1] Factory: could not find obj from pev=%p\n", pev);
+        return;
+    }
+
+    Log("[janus1] obj=%p orig_vtable=%p\n", obj, *reinterpret_cast<void**>(obj));
+
+    // Swap the vtable
+    SwapVtable(obj);
+
     Log("[janus1] Factory done\n");
 }
 
 // -----------------------------------------------------------------------
-// PostInit
+// PostInit — called after Hooks_Install succeeds
 // -----------------------------------------------------------------------
 void Janus1_PostInit(uintptr_t mpBase)
 {
-    Log("[janus1] PostInit\n");
+    Log("[janus1] PostInit mpBase=0x%08zX\n", mpBase);
 
-    // Saved bytes
-    const uint8_t* saved = GetSavedBytes(RVA_weapon_janus1);
-    if (saved) {
-        memcpy(g_savedBytes, saved, 5);
-        g_savedOk = true;
-    } else {
-        // IDA confirmed: 55 8B EC 56 8B
-        uint8_t fb[5] = {0x55,0x8B,0xEC,0x56,0x8B};
-        memcpy(g_savedBytes, fb, 5);
-        g_savedOk = true;
-    }
-    Log("[janus1] Saved: %02X %02X %02X %02X %02X\n",
-        g_savedBytes[0],g_savedBytes[1],g_savedBytes[2],
-        g_savedBytes[3],g_savedBytes[4]);
-
-    // Engine functions by RVA
+    // --- Engine function pointers ---
+    // Each entry in the engfuncs table is a 4-byte fn pointer
+    // RVA_pfnPrecacheModel = engfuncs[0]
+    // We read the POINTER-TO-FUNCTION stored at each location
     __try {
         g_fnPrecacheModel = *reinterpret_cast<pfnPrecacheModel_t*>(mpBase + RVA_pfnPrecacheModel);
         g_fnPrecacheSound = *reinterpret_cast<pfnPrecacheSound_t*>(mpBase + RVA_pfnPrecacheSound);
-        g_fnPrecacheEvent = *reinterpret_cast<pfnPrecacheEvent_t*>(mpBase + RVA_pfnPrecacheEvent);
         g_fnSetModel      = *reinterpret_cast<pfnSetModel_t*>      (mpBase + RVA_pfnSetModel);
-        g_pTime           = *reinterpret_cast<float**>             (mpBase + RVA_pGlobals);
+        g_fnPrecacheEvent = *reinterpret_cast<pfnPrecacheEvent_t*> (mpBase + RVA_pfnPrecacheEvent);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        Log("[janus1] Exception reading engine fns!\n");
     }
-    __except(EXCEPTION_EXECUTE_HANDLER) { Log("[janus1] Exception resolving engine fns\n"); }
 
-    Log("[janus1] PrecacheModel=%p Sound=%p Event=%p SetModel=%p\n",
+    // --- gpGlobals time ---
+    // RVA_pGlobals: mp.dll stores a pointer to globalvars_t
+    // *((globalvars_t**)(mp + RVA_pGlobals)) = gpGlobals
+    // gpGlobals->time is at offset 0 (first field)
+    __try {
+        uintptr_t pGlobalsAddr = *reinterpret_cast<uintptr_t*>(mpBase + RVA_pGlobals);
+        if (pGlobalsAddr) {
+            g_pTime          = reinterpret_cast<float*>(pGlobalsAddr); // time = offset 0
+            s_pGlobalsBase   = reinterpret_cast<float*>(pGlobalsAddr); // base for other fields
+        }
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        Log("[janus1] Exception reading pGlobals!\n");
+    }
+
+    Log("[janus1] PrecacheModel=%p Sound=%p SetModel=%p Event=%p time=%p\n",
         (void*)g_fnPrecacheModel, (void*)g_fnPrecacheSound,
-        (void*)g_fnPrecacheEvent, (void*)g_fnSetModel);
+        (void*)g_fnSetModel,      (void*)g_fnPrecacheEvent, (void*)g_pTime);
+    Log("[janus1] Current time=%.3f\n", SafeTime());
 
-    // M79 vtable for delegation
+    // --- M79 vtable ---
     g_m79Vtable = reinterpret_cast<void**>(mpBase + RVA_CM79_vtable);
-    Log("[janus1] M79 vtable @ %p slot[0]=%p\n",
-        g_m79Vtable, g_m79Vtable ? g_m79Vtable[0] : nullptr);
+    Log("[janus1] M79 vtable @ %p, slot[0]=%p slot[167]=%p\n",
+        (void*)g_m79Vtable,
+        g_m79Vtable ? g_m79Vtable[0] : nullptr,
+        g_m79Vtable ? g_m79Vtable[167] : nullptr);
 
-    // Build CJanus1 vtable via placement-new
+    // --- Saved bytes ---
+    const uint8_t* sb = GetSavedBytes(RVA_weapon_janus1);
+    if (sb) {
+        memcpy(g_savedBytes, sb, 5);
+        Log("[janus1] Saved bytes: %02X %02X %02X %02X %02X\n",
+            sb[0], sb[1], sb[2], sb[3], sb[4]);
+    } else {
+        // Fallback — IDA confirmed: 55 8B EC 56 8B
+        g_savedBytes[0] = 0x55; g_savedBytes[1] = 0x8B;
+        g_savedBytes[2] = 0xEC; g_savedBytes[3] = 0x56;
+        g_savedBytes[4] = 0x8B;
+        Log("[janus1] Using fallback saved bytes\n");
+    }
+
+    // --- Build CJanus1 vtable ---
     InitVtable();
 
-    g_ready = g_savedOk && g_vtableInit;
-    Log("[janus1] PostInit done. ready=%d\n", (int)g_ready);
+    // --- Verify engine fns are valid hw.dll addresses (should be > 0x02000000) ---
+    bool engOk = (uintptr_t)g_fnPrecacheModel > 0x01000000 &&
+                 (uintptr_t)g_fnPrecacheSound  > 0x01000000;
+
+    g_factoryReady = g_ourVtable && engOk && g_pTime;
+    Log("[janus1] PostInit done. factoryReady=%d vtable=%p engOk=%d time=%p\n",
+        (int)g_factoryReady, g_ourVtable, (int)engOk, (void*)g_pTime);
 }
 
 // -----------------------------------------------------------------------
-// Static registration
+// Static registration — runs before main(), registers the hook
 // -----------------------------------------------------------------------
-struct Janus1Reg {
-    Janus1Reg() { RegisterWeaponHook("weapon_janus1", (void*)Janus1_Factory, RVA_weapon_janus1); }
+struct Janus1Registrar {
+    Janus1Registrar() {
+        RegisterWeaponHook("weapon_janus1", (void*)Janus1_Factory, RVA_weapon_janus1);
+    }
 };
-static Janus1Reg g_reg;
+static Janus1Registrar g_janus1Reg;
