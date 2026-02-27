@@ -21,3 +21,9 @@ static const int WEAPON_JANUS1 = 570; // from game data (adjust if needed)
 #define JANUS1_SOUND_FIRE  "weapons/janus1-1.wav"
 #define JANUS1_SOUND_RELOAD "weapons/janus1_reload.wav"
 #define JANUS1_EVENT    "events/janus1.sc"
+
+// Janus1 original vtable - from log: orig_vtable=0x24689034, mp=0x235E0000
+// RVA = 0x24689034 - 0x235E0000 = 0x10A9034
+// Cross-check: also seen as 0x24B89034 - 0x23540000 = 0x1649034
+// Use the one from latest log (mp=0x235E0000): 0x10A9034
+static const uintptr_t RVA_Janus1_vtable = 0x1649034;
