@@ -1,5 +1,6 @@
 // janus1.cpp - Direct vtable patch on CJanus1 in mp.dll
-// Slots verified from IDA: AddToPlayer=95, Deploy=102, WeaponIdle=142, Holster=168
+// CRITICAL: vtable slots are called as __thiscall by the engine.
+// Wrappers must be __thiscall. Use a dummy class to get __thiscall methods.
 
 #include "janus1.h"
 #include "../hooks.h"
@@ -20,37 +21,36 @@ static void* g_origWeaponIdle  = nullptr;
 static void* g_origAddToPlayer = nullptr;
 static void* g_origHolster     = nullptr;
 
-static int __fastcall J1_Deploy(void* self, void* /*edx*/)
+// Dummy class so we can write __thiscall methods
+struct CJanus1Hook
 {
-    Log("[janus1] Deploy enter\n");
-    typedef int(__thiscall* Fn)(void*);
-    int r = reinterpret_cast<Fn>(g_origDeploy)(self);
-    Log("[janus1] Deploy exit ret=%d\n", r);
-    return r;
-}
+    int Deploy()
+    {
+        Log("[janus1] Deploy\n");
+        typedef int(__thiscall* Fn)(void*);
+        return reinterpret_cast<Fn>(g_origDeploy)(this);
+    }
 
-static void __fastcall J1_WeaponIdle(void* self, void* /*edx*/)
-{
-    typedef void(__thiscall* Fn)(void*);
-    reinterpret_cast<Fn>(g_origWeaponIdle)(self);
-}
+    void WeaponIdle()
+    {
+        typedef void(__thiscall* Fn)(void*);
+        reinterpret_cast<Fn>(g_origWeaponIdle)(this);
+    }
 
-static int __fastcall J1_AddToPlayer(void* self, void* /*edx*/, void* player)
-{
-    Log("[janus1] AddToPlayer enter self=%p player=%p\n", self, player);
-    typedef int(__thiscall* Fn)(void*, void*);
-    int r = reinterpret_cast<Fn>(g_origAddToPlayer)(self, player);
-    Log("[janus1] AddToPlayer exit ret=%d\n", r);
-    return r;
-}
+    int AddToPlayer(void* player)
+    {
+        Log("[janus1] AddToPlayer\n");
+        typedef int(__thiscall* Fn)(void*, void*);
+        return reinterpret_cast<Fn>(g_origAddToPlayer)(this, player);
+    }
 
-static void __fastcall J1_Holster(void* self, void* /*edx*/, int skiplocal)
-{
-    Log("[janus1] Holster enter skip=%d\n", skiplocal);
-    typedef void(__thiscall* Fn)(void*, int);
-    reinterpret_cast<Fn>(g_origHolster)(self, skiplocal);
-    Log("[janus1] Holster exit\n");
-}
+    void Holster()
+    {
+        Log("[janus1] Holster\n");
+        typedef void(__thiscall* Fn)(void*);
+        reinterpret_cast<Fn>(g_origHolster)(this);
+    }
+};
 
 static bool PatchVtableSlot(void** vtable, int slot, void* newFn, void** outOrig)
 {
@@ -71,12 +71,17 @@ void Janus1_PostInit(uintptr_t mpBase)
 {
     Log("[janus1] PostInit\n");
     void** vtable = reinterpret_cast<void**>(mpBase + RVA_CJanus1_vtable);
-    Log("[janus1] Patching vtable @ %p\n", (void*)vtable);
 
-    PatchVtableSlot(vtable, SLOT_Deploy,      (void*)J1_Deploy,      &g_origDeploy);
-    PatchVtableSlot(vtable, SLOT_WeaponIdle,  (void*)J1_WeaponIdle,  &g_origWeaponIdle);
-    PatchVtableSlot(vtable, SLOT_AddToPlayer, (void*)J1_AddToPlayer, &g_origAddToPlayer);
-    PatchVtableSlot(vtable, SLOT_Holster,     (void*)J1_Holster,     &g_origHolster);
+    // Get method pointers from the dummy class - these are __thiscall
+    void* fnDeploy      = (void*)(int(CJanus1Hook::*)())      &CJanus1Hook::Deploy;
+    void* fnWeaponIdle  = (void*)(void(CJanus1Hook::*)())     &CJanus1Hook::WeaponIdle;
+    void* fnAddToPlayer = (void*)(int(CJanus1Hook::*)(void*)) &CJanus1Hook::AddToPlayer;
+    void* fnHolster     = (void*)(void(CJanus1Hook::*)())     &CJanus1Hook::Holster;
+
+    PatchVtableSlot(vtable, SLOT_Deploy,      fnDeploy,      &g_origDeploy);
+    PatchVtableSlot(vtable, SLOT_WeaponIdle,  fnWeaponIdle,  &g_origWeaponIdle);
+    PatchVtableSlot(vtable, SLOT_AddToPlayer, fnAddToPlayer, &g_origAddToPlayer);
+    PatchVtableSlot(vtable, SLOT_Holster,     fnHolster,     &g_origHolster);
 
     Log("[janus1] PostInit done\n");
 }
