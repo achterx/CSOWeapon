@@ -1,12 +1,18 @@
 // janus1.cpp - Janus1 weapon
-// Slot numbers verified directly from IDA CJanus1 vtable at 0x11649034:
-//   Slot   3: Spawn        sub_10E964E0
-//   Slot   4: Precache     sub_10E92CD0
-//   Slot  95: AddToPlayer  sub_10E95AD0
-//   Slot 102: Deploy       sub_10E95CD0
-//   Slot 142: WeaponIdle   sub_10E92E70
-//   Slot 168: Holster      sub_10E92D80
-// Total vtable size: 201 slots
+// 
+// NEW APPROACH: Instead of copying+swapping the whole vtable,
+// directly patch the specific slots in the ORIGINAL CJanus1 vtable in mp.dll.
+// The vtable is in .rdata (read-only), so we VirtualProtect it writable,
+// write our function pointers, then restore protection.
+//
+// This is cleaner: no vtable copy, no object-finding, no pointer chain.
+// The original vtable is patched once at startup and affects ALL Janus1 objects.
+//
+// Slots from IDA (RVA from mp base = 0x1649034):
+//   Slot 102: Deploy      @ vtable + 102*4
+//   Slot 142: WeaponIdle  @ vtable + 142*4  
+//   Slot  95: AddToPlayer @ vtable + 95*4
+//   Slot 168: Holster     @ vtable + 168*4
 
 #include "janus1.h"
 #include "../hooks.h"
@@ -15,47 +21,21 @@
 #include <cstdint>
 #include <windows.h>
 
-static void** g_vtable      = nullptr;
-static bool   g_vtableReady = false;
+static const uintptr_t RVA_CJanus1_vtable = 0x1649034;
 
-static void* g_origPrecache    = nullptr;
-static void* g_origSpawn       = nullptr;
+static const int SLOT_AddToPlayer = 95;
+static const int SLOT_Deploy      = 102;
+static const int SLOT_WeaponIdle  = 142;
+static const int SLOT_Holster     = 168;
+
 static void* g_origDeploy      = nullptr;
 static void* g_origWeaponIdle  = nullptr;
 static void* g_origAddToPlayer = nullptr;
 static void* g_origHolster     = nullptr;
 
-static uint8_t g_origBytes[5] = {};
-static bool    g_origSaved    = false;
-typedef void(__cdecl* pfnOrigFactory_t)(int);
-
-// Correct slot numbers from IDA
-static const int SLOT_Spawn       = 3;
-static const int SLOT_Precache    = 4;
-static const int SLOT_AddToPlayer = 95;
-static const int SLOT_Deploy      = 102;
-static const int SLOT_WeaponIdle  = 142;
-static const int SLOT_Holster     = 168;
-static const int VTABLE_SIZE      = 201;
-
 // -----------------------------------------------------------------------
-// Overrides - log and call original Janus1 implementations
+// Overrides
 // -----------------------------------------------------------------------
-// Safe Precache - only calls real Precache during map load (time == 0)
-// If called at runtime (time > 0), silently returns -- avoids pfnPrecacheSound crash
-static int __fastcall J1_Precache(void* self, void* /*edx*/)
-{
-    float t = GetTime();
-    if (t > 0.0f)
-    {
-        Log("[janus1] Precache suppressed at t=%.1f\n", t);
-        return 1;
-    }
-    Log("[janus1] Precache (map load)\n");
-    typedef int(__thiscall* Fn)(void*);
-    return reinterpret_cast<Fn>(g_origPrecache)(self);
-}
-
 static int __fastcall J1_Deploy(void* self, void* /*edx*/)
 {
     Log("[janus1] Deploy\n");
@@ -84,123 +64,59 @@ static void __fastcall J1_Holster(void* self, void* /*edx*/, int skiplocal)
 }
 
 // -----------------------------------------------------------------------
-// Build vtable from live object
+// Patch a single vtable slot
 // -----------------------------------------------------------------------
-static bool BuildVtableFromObject(void* obj)
+static bool PatchVtableSlot(void** vtable, int slot, void* newFn, void** outOrig)
 {
-    void** origVtbl = *reinterpret_cast<void***>(obj);
-    Log("[janus1] Live vtable @ %p\n", (void*)origVtbl);
-
-    g_vtable = reinterpret_cast<void**>(
-        VirtualAlloc(nullptr, VTABLE_SIZE * sizeof(void*),
-                     MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-    if (!g_vtable) { Log("[janus1] VirtualAlloc failed\n"); return false; }
-
-    __try { memcpy(g_vtable, origVtbl, VTABLE_SIZE * sizeof(void*)); }
-    __except(EXCEPTION_EXECUTE_HANDLER)
+    void** entry = &vtable[slot];
+    DWORD old = 0;
+    if (!VirtualProtect(entry, sizeof(void*), PAGE_EXECUTE_READWRITE, &old))
     {
-        Log("[janus1] memcpy failed\n");
-        VirtualFree(g_vtable, 0, MEM_RELEASE);
-        g_vtable = nullptr;
+        Log("[janus1] VirtualProtect failed for slot %d\n", slot);
         return false;
     }
-
-    // Save originals before patching
-    g_origPrecache    = origVtbl[SLOT_Precache];
-    g_origDeploy      = origVtbl[SLOT_Deploy];
-    g_origWeaponIdle  = origVtbl[SLOT_WeaponIdle];
-    g_origAddToPlayer = origVtbl[SLOT_AddToPlayer];
-    g_origHolster     = origVtbl[SLOT_Holster];
-
-    Log("[janus1] Saved: Deploy[%d]=%p WeaponIdle[%d]=%p AddToPlayer[%d]=%p Holster[%d]=%p\n",
-        SLOT_Deploy, g_origDeploy,
-        SLOT_WeaponIdle, g_origWeaponIdle,
-        SLOT_AddToPlayer, g_origAddToPlayer,
-        SLOT_Holster, g_origHolster);
-
-    g_vtable[SLOT_Precache]    = (void*)J1_Precache;
-    g_vtable[SLOT_Deploy]      = (void*)J1_Deploy;
-    g_vtable[SLOT_WeaponIdle]  = (void*)J1_WeaponIdle;
-    g_vtable[SLOT_AddToPlayer] = (void*)J1_AddToPlayer;
-    g_vtable[SLOT_Holster]     = (void*)J1_Holster;
-
-    g_vtableReady = true;
-    Log("[janus1] Vtable ready (%d slots)\n", VTABLE_SIZE);
+    *outOrig = *entry;
+    *entry = newFn;
+    VirtualProtect(entry, sizeof(void*), old, &old);
     return true;
 }
 
 // -----------------------------------------------------------------------
-// Trampoline
-// -----------------------------------------------------------------------
-static void CallOrigJanus1(int edict)
-{
-    if (!g_origSaved) return;
-    uintptr_t target = GetMpBase() + RVA_weapon_janus1;
-    DWORD old = 0;
-    VirtualProtect((void*)target, 5, PAGE_EXECUTE_READWRITE, &old);
-    memcpy((void*)target, g_origBytes, 5);
-    VirtualProtect((void*)target, 5, old, &old);
-    reinterpret_cast<pfnOrigFactory_t>(target)(edict);
-    WriteJmp5(target, (uintptr_t)Janus1_Factory, nullptr);
-}
-
-// -----------------------------------------------------------------------
-// Factory
-// -----------------------------------------------------------------------
-void __cdecl Janus1_Factory(int edict)
-{
-    Log("[janus1] Factory edict=%d\n", edict);
-    CallOrigJanus1(edict);
-
-    void* obj = nullptr;
-    __try
-    {
-        uint8_t* inner = *reinterpret_cast<uint8_t**>(
-            reinterpret_cast<uint8_t*>((uintptr_t)edict) + 0x238);
-        if (inner)
-            obj = *reinterpret_cast<void**>(inner + 0x80);
-    }
-    __except(EXCEPTION_EXECUTE_HANDLER)
-    {
-        Log("[janus1] Exception finding obj\n");
-        return;
-    }
-    if (!obj) { Log("[janus1] obj null\n"); return; }
-
-    if (!g_vtableReady)
-        if (!BuildVtableFromObject(obj)) return;
-
-    *reinterpret_cast<void**>(obj) = g_vtable;
-    Log("[janus1] Swapped on obj=%p -- factory returning now\n", obj);
-}
-
-// -----------------------------------------------------------------------
-// PostInit
+// PostInit - patch the live vtable directly
 // -----------------------------------------------------------------------
 void Janus1_PostInit(uintptr_t mpBase)
 {
     Log("[janus1] PostInit\n");
 
-    // Nothing extra needed - J1_Precache uses GetTime() from hooks
-    const uint8_t* sb = GetSavedBytes(RVA_weapon_janus1);
-    if (sb) { memcpy(g_origBytes, sb, 5); g_origSaved = true; }
-    else
-    {
-        g_origBytes[0]=0x55; g_origBytes[1]=0x8B; g_origBytes[2]=0xEC;
-        g_origBytes[3]=0x56; g_origBytes[4]=0x8B;
-        g_origSaved = true;
-    }
+    void** vtable = reinterpret_cast<void**>(mpBase + RVA_CJanus1_vtable);
+    Log("[janus1] Patching CJanus1 vtable @ %p\n", (void*)vtable);
+
+    PatchVtableSlot(vtable, SLOT_Deploy,      (void*)J1_Deploy,      &g_origDeploy);
+    PatchVtableSlot(vtable, SLOT_WeaponIdle,  (void*)J1_WeaponIdle,  &g_origWeaponIdle);
+    PatchVtableSlot(vtable, SLOT_AddToPlayer, (void*)J1_AddToPlayer, &g_origAddToPlayer);
+    PatchVtableSlot(vtable, SLOT_Holster,     (void*)J1_Holster,     &g_origHolster);
+
+    Log("[janus1] Patched: Deploy[%d]=%p WeaponIdle[%d]=%p AddToPlayer[%d]=%p Holster[%d]=%p\n",
+        SLOT_Deploy,      g_origDeploy,
+        SLOT_WeaponIdle,  g_origWeaponIdle,
+        SLOT_AddToPlayer, g_origAddToPlayer,
+        SLOT_Holster,     g_origHolster);
     Log("[janus1] PostInit done\n");
 }
 
+// No factory hook needed - vtable is patched globally
+// weapon_janus1 factory runs normally, objects get our patched slots automatically
+void __cdecl Janus1_Factory(int edict) {}
+
 // -----------------------------------------------------------------------
-// Registration
+// Registration - still register hook so hooks.cpp installs correctly,
+// but we don't actually need the factory intercept anymore
 // -----------------------------------------------------------------------
 struct Janus1Reg
 {
     Janus1Reg()
     {
-        RegisterWeaponHook("weapon_janus1", (void*)Janus1_Factory, RVA_weapon_janus1);
+        // No factory hook needed - direct vtable patch in PostInit
     }
 };
 static Janus1Reg g_reg;
